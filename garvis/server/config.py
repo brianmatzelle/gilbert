@@ -20,7 +20,11 @@ ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 
 # Eleven Labs Configuration
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "JBFqnCBsd6RMkjVDRZzb")  # George voice
-ELEVENLABS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_turbo_v2_5")
+# Flash model has ~75ms inference (faster) vs turbo_v2_5 at ~150ms
+ELEVENLABS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5")
+# MP3 is the only reliably supported format for WebSocket streaming
+# We'll convert to PCM for Discord in the pipeline
+ELEVENLABS_OUTPUT_FORMAT = os.getenv("ELEVENLABS_OUTPUT_FORMAT", "mp3_44100_128")
 
 # Discord Bot Configuration
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
@@ -82,5 +86,8 @@ AUDIO_PROCESS_INTERVAL = float(os.getenv("AUDIO_PROCESS_INTERVAL", "0.05"))  # h
 AUDIO_SILENCE_THRESHOLD = float(os.getenv("AUDIO_SILENCE_THRESHOLD", "0.2"))  # silence before speech end callback (default was 0.3)
 
 # TTS streaming configuration  
-TTS_BUFFER_THRESHOLD = int(os.getenv("TTS_BUFFER_THRESHOLD", "500"))  # bytes before flushing TTS audio (default was 1000)
+# Prebuffer: milliseconds of audio to accumulate before starting playback (smooths network jitter)
+TTS_PREBUFFER_MS = int(os.getenv("TTS_PREBUFFER_MS", "250"))
+# Legacy setting (no longer used with WebSocket TTS)
+TTS_BUFFER_THRESHOLD = int(os.getenv("TTS_BUFFER_THRESHOLD", "500"))
 

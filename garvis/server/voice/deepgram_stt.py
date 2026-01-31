@@ -234,6 +234,13 @@ class DeepgramSTT:
                 if DEEPGRAM_USE_SPEECH_FINAL and speech_final and not self._speech_final_fired:
                     # Use current_transcript if available, otherwise use this message's transcript
                     final_text = self.current_transcript or transcript
+                    # #region agent log
+                    import json
+                    try:
+                        with open('/mnt/s/Projects/guitar2discord/.cursor/debug.log', 'a') as f:
+                            f.write(json.dumps({"hypothesisId":"A,B","location":"deepgram_stt.py:speech_final","message":"speech_final firing","data":{"final_text":final_text[:50] if final_text else "","current_transcript":self.current_transcript[:50] if self.current_transcript else "","speech_final_fired_before":self._speech_final_fired},"timestamp":int(time.time()*1000)}) + '\n')
+                    except: pass
+                    # #endregion
                     if final_text:
                         self._speech_final_fired = True
                         await self.on_speech_end(final_text)
@@ -250,6 +257,13 @@ class DeepgramSTT:
         
         elif msg_type == "SpeechStarted":
             # User started speaking - reset the speech_final flag
+            # #region agent log
+            import json
+            try:
+                with open('/mnt/s/Projects/guitar2discord/.cursor/debug.log', 'a') as f:
+                    f.write(json.dumps({"hypothesisId":"E","location":"deepgram_stt.py:SpeechStarted","message":"SpeechStarted - resetting _speech_final_fired","data":{"current_transcript":self.current_transcript[:50] if self.current_transcript else "","was_speech_final_fired":self._speech_final_fired},"timestamp":int(time.time()*1000)}) + '\n')
+            except: pass
+            # #endregion
             self._speech_final_fired = False
         
         elif msg_type == "Metadata":

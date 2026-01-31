@@ -31,8 +31,9 @@ class VoiceState:
         self.pipeline: Optional[DiscordVoicePipeline] = None
         self.audio_sink: Optional[GarvisAudioSink] = None
         self.target_user_id: Optional[int] = None  # Who we're listening to
-        self._audio_queue: asyncio.Queue[bytes] = asyncio.Queue()
+        self._audio_buffer = io.BytesIO()  # Accumulate audio for smooth playback
         self._playback_task: Optional[asyncio.Task] = None
+        self._playback_lock = asyncio.Lock()  # Prevent concurrent playback issues
 
 
 class GarvisDiscordBot(commands.Bot):
@@ -177,7 +178,7 @@ class GarvisDiscordBot(commands.Bot):
         
         # Create the voice pipeline
         state.pipeline = DiscordVoicePipeline(
-            on_audio_output=lambda audio: self._play_audio(state, audio),
+            on_audio_output=lambda audio, flush: self._play_audio(state, audio, flush),
             on_transcript=lambda text, role, final: self._handle_transcript(ctx, text, role, final),
             on_status=lambda listening, speaking: self._handle_status(ctx, listening, speaking)
         )
@@ -247,54 +248,63 @@ class GarvisDiscordBot(commands.Bot):
         """Callback when recording finishes."""
         print(f"📹 Recording finished in {channel.name}")
     
-    async def _play_audio(self, state: VoiceState, pcm_data: bytes):
+    async def _play_audio(self, state: VoiceState, pcm_data: bytes, flush: bool = False):
         """
         Play PCM audio to the voice channel.
+        
+        Audio is accumulated into a buffer and played as larger continuous chunks
+        to eliminate gaps between small chunks.
         
         Args:
             state: Voice state for the guild
             pcm_data: PCM audio data (48kHz stereo 16-bit)
+            flush: If True, flush all remaining audio immediately (for end of response)
         """
         if not state.voice_client or not state.voice_client.is_connected():
             return
         
-        # Queue the audio for playback
-        await state._audio_queue.put(pcm_data)
-        
-        # Start playback task if not running
-        if not state._playback_task or state._playback_task.done():
-            state._playback_task = asyncio.create_task(
-                self._playback_loop(state)
-            )
+        async with state._playback_lock:
+            # Accumulate audio in buffer
+            if pcm_data:
+                state._audio_buffer.write(pcm_data)
+            
+            # Play accumulated audio when we have enough (or when flush requested)
+            # 48kHz stereo 16-bit = 192000 bytes/sec
+            # Play in ~250ms chunks to match TTS prebuffer
+            MIN_PLAYBACK_BYTES = 48000  # ~250ms of audio
+            
+            if flush or state._audio_buffer.tell() >= MIN_PLAYBACK_BYTES:
+                await self._flush_audio_buffer(state, wait_for_completion=flush)
     
-    async def _playback_loop(self, state: VoiceState):
-        """Background task that plays queued audio."""
-        try:
-            while True:
-                # Get audio from queue
-                pcm_data = await asyncio.wait_for(
-                    state._audio_queue.get(),
-                    timeout=5.0
-                )
-                
-                if not state.voice_client or not state.voice_client.is_connected():
-                    break
-                
-                # Create audio source and play
-                source = discord.PCMAudio(io.BytesIO(pcm_data))
-                
-                # Wait for current audio to finish
-                while state.voice_client.is_playing():
-                    await asyncio.sleep(0.1)
-                
-                state.voice_client.play(source)
+    async def _flush_audio_buffer(self, state: VoiceState, wait_for_completion: bool = False):
+        """Flush accumulated audio to playback."""
+        if state._audio_buffer.tell() == 0:
+            return
         
-        except asyncio.TimeoutError:
-            pass  # No more audio to play
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            print(f"❌ Playback error: {e}")
+        if not state.voice_client or not state.voice_client.is_connected():
+            state._audio_buffer.seek(0)
+            state._audio_buffer.truncate()
+            return
+        
+        # Wait for any current playback to finish
+        while state.voice_client.is_playing():
+            await asyncio.sleep(0.02)
+        
+        # Get accumulated audio
+        state._audio_buffer.seek(0)
+        audio_data = state._audio_buffer.read()
+        state._audio_buffer.seek(0)
+        state._audio_buffer.truncate()
+        
+        if audio_data:
+            # Play the accumulated audio as a single source
+            source = discord.PCMAudio(io.BytesIO(audio_data))
+            state.voice_client.play(source)
+            
+            # Optionally wait for playback to complete
+            if wait_for_completion:
+                while state.voice_client.is_playing():
+                    await asyncio.sleep(0.02)
     
     async def _handle_transcript(self, ctx, text: str, role: str, is_final: bool):
         """Handle transcript updates."""

@@ -152,8 +152,11 @@ Client                                  Server
 | `DEEPGRAM_API_KEY` | ✅ | — | Deepgram API key |
 | `ELEVENLABS_API_KEY` | ✅ | — | Eleven Labs API key |
 | `ELEVENLABS_VOICE_ID` | ❌ | `JBFqnCBsd6RMkjVDRZzb` | Voice ID (George) |
-| `ELEVENLABS_MODEL_ID` | ❌ | `eleven_turbo_v2_5` | TTS model |
+| `ELEVENLABS_MODEL_ID` | ❌ | `eleven_flash_v2_5` | TTS model (flash is faster) |
+| `ELEVENLABS_OUTPUT_FORMAT` | ❌ | `mp3_44100_128` | Audio format (WebSocket only supports MP3) |
 | `CLAUDE_MODEL` | ❌ | `claude-sonnet-4-20250514` | Claude model |
+| `DISCORD_BOT_TOKEN` | ❌ | — | Discord bot token (for voice bot) |
+| `DISCORD_SEND_TEXT_MESSAGES` | ❌ | `true` | Send responses to text chat |
 
 ### Service Configuration
 
@@ -223,6 +226,71 @@ async def control_lights(room: str, brightness: int) -> dict:
 3. **Error handling** — Return error info rather than raising exceptions
 4. **Async** — Use `async def` for I/O-bound operations
 
+## 🎙️ Discord Bot
+
+The server includes a Discord voice bot that brings Garvis to Discord voice channels.
+
+### Running the Discord Bot
+
+```bash
+# From the garvis directory
+./run-discord-bot.sh
+
+# Or directly
+cd server && uv run python -m discord_bot.bot
+```
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `!join` | Join your voice channel and start listening |
+| `!leave` | Leave the voice channel |
+| `!listen @user` | Only respond to a specific user |
+| `!listen all` | Respond to everyone (default) |
+| `!status` | Show current bot status |
+
+### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DISCORD_BOT_TOKEN` | — | Bot token from Discord Developer Portal |
+| `DISCORD_SEND_TEXT_MESSAGES` | `true` | Also send responses to text chat |
+
+### Architecture
+
+```
+Discord Voice Channel
+        │
+        ▼ (48kHz stereo PCM)
+┌───────────────────┐
+│   Audio Sink      │ ── Resample to 16kHz mono
+└─────────┬─────────┘
+          │
+          ▼
+┌───────────────────┐
+│   Deepgram STT    │ ── Real-time transcription
+└─────────┬─────────┘
+          │
+          ▼
+┌───────────────────┐
+│   Claude LLM      │ ── Generate response
+└─────────┬─────────┘
+          │
+          ▼
+┌───────────────────┐
+│  ElevenLabs TTS   │ ── WebSocket streaming (MP3)
+└─────────┬─────────┘
+          │
+          ▼
+┌───────────────────┐
+│  Voice Pipeline   │ ── Convert MP3 → PCM (48kHz stereo)
+└─────────┬─────────┘
+          │
+          ▼
+Discord Voice Channel (playback)
+```
+
 ## 📁 File Structure
 
 ```
@@ -236,6 +304,12 @@ server/
 │   ├── __init__.py      # Router exports
 │   ├── health.py        # Health check endpoints
 │   └── proxy.py         # HLS video proxy
+│
+├── discord_bot/         # Discord voice assistant
+│   ├── __init__.py      # Module exports
+│   ├── bot.py           # Discord bot + commands
+│   ├── audio_sink.py    # Capture voice channel audio
+│   └── voice_pipeline.py # Discord-adapted pipeline (MP3→PCM)
 │
 ├── providers/           # Content provider system
 │   ├── __init__.py      # Provider exports
@@ -253,11 +327,11 @@ server/
 │
 └── voice/
     ├── __init__.py      # Module exports
-    ├── websocket.py     # WebSocket handler
+    ├── websocket.py     # WebSocket handler (XR client)
     ├── pipeline.py      # Voice pipeline + stream_url handling
     ├── deepgram_stt.py  # Speech-to-text
     ├── claude_llm.py    # Claude LLM with tool calling
-    └── elevenlabs_tts.py # Text-to-speech
+    └── elevenlabs_tts.py # Text-to-speech (WebSocket API)
 ```
 
 ## 📺 Video Streaming Components
@@ -374,23 +448,40 @@ Claude integration for conversational responses.
 
 ### ElevenLabsTTS
 
-Real-time text-to-speech using Eleven Labs streaming API.
+Real-time text-to-speech using ElevenLabs WebSocket API for lowest latency.
 
 **Features:**
-- Streaming input → streaming output
-- Low-latency Turbo model
-- Natural voice synthesis
+- WebSocket streaming for bidirectional communication
+- Text buffering to meet ElevenLabs' minimum chunk requirements (50+ chars)
+- Audio buffering for smooth playback (prebuffers ~8KB before starting)
+- Flash model (`eleven_flash_v2_5`) for ~75ms inference time
+
+**Architecture:**
+```
+Claude text chunks → Buffer 50+ chars → ElevenLabs WebSocket → MP3 chunks → Buffer 8KB → Convert to PCM → Discord/Client
+```
+
+**Why WebSocket over HTTP?**
+- Lower time-to-first-byte for streaming text input
+- Better handling of partial text from LLM streaming
+- Automatic chunk scheduling with `generation_config`
 
 **Configuration:**
 ```python
-# Voice settings
-VoiceSettings(
-    stability=0.5,
-    similarity_boost=0.75,
-    style=0.0,
-    use_speaker_boost=True
-)
+# Voice settings (in handshake message)
+{
+    "stability": 0.5,
+    "similarity_boost": 0.75,
+    "speed": 1.0
+}
+
+# Generation config for faster first audio
+{
+    "chunk_length_schedule": [50, 120, 200, 260]
+}
 ```
+
+**Note:** WebSocket API only supports MP3 output format. PCM conversion is handled by the voice pipeline.
 
 ## 🐛 Debugging
 
@@ -412,10 +503,16 @@ uv run uvicorn main:app --host 0.0.0.0 --port 8000 --log-level debug
 - Tune system prompt for shorter responses
 - Check Anthropic API status
 
-**TTS audio stuttering:**
-- Use `eleven_turbo_v2_5` for lowest latency
-- Check network bandwidth
-- Ensure stable WebSocket connection
+**TTS audio stuttering or choppy:**
+- Use `eleven_flash_v2_5` for lowest latency (~75ms vs ~150ms for turbo)
+- The WebSocket TTS buffers text (50+ chars) and audio (8KB) before sending
+- Check network bandwidth and stability
+- MP3 conversion to PCM happens in 16KB chunks to avoid partial frame issues
+
+**No audio from ElevenLabs:**
+- WebSocket API only supports MP3 format (not PCM)
+- Check for `output_format_not_allowed` error in logs
+- Ensure `ELEVENLABS_OUTPUT_FORMAT=mp3_44100_128`
 
 ## 📊 Performance
 
