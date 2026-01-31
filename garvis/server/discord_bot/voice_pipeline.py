@@ -84,6 +84,8 @@ class DiscordVoicePipeline:
         self.current_transcript = ""
         
         self._running = False
+        self._processing_response = False  # Prevent double-triggering
+        self._pending_transcript = ""  # Latest transcript from Deepgram
         
         # Audio buffer for TTS output conversion
         self._tts_buffer = io.BytesIO()
@@ -208,6 +210,10 @@ class DiscordVoicePipeline:
         text = self._normalize_transcript(text)
         self.current_transcript = text
         
+        # Store the latest transcript for when silence is detected
+        if text.strip():
+            self._pending_transcript = text
+        
         if self.on_transcript:
             await self.on_transcript(text, "user", is_final)
         
@@ -215,12 +221,36 @@ class DiscordVoicePipeline:
             self.is_listening = True
             await self._send_status()
     
+    async def handle_user_silence(self):
+        """
+        Called when Discord detects the user stopped speaking.
+        This triggers faster than Deepgram's speech_final, giving us lower latency.
+        """
+        # Don't trigger if already processing or no transcript
+        if self._processing_response or not self._pending_transcript.strip():
+            return
+        
+        # Trigger response immediately with whatever transcript we have
+        await self._handle_speech_end(self._pending_transcript)
+    
     async def _handle_speech_end(self, final_transcript: str):
         """Handle end of user speech (VAD triggered)."""
+        import time
+        
         if not final_transcript.strip():
             return
         
+        # Prevent double-triggering
+        if self._processing_response:
+            return
+        self._processing_response = True
+        
+        t_start = time.time()
+        
         final_transcript = self._normalize_transcript(final_transcript)
+        
+        # Clear pending transcript to prevent re-triggering
+        self._pending_transcript = ""
         
         self.is_listening = False
         await self._send_status()
@@ -238,19 +268,20 @@ class DiscordVoicePipeline:
         await self._send_status()
         
         assistant_response = ""
+        t_llm_start = time.time()
+        t_first_chunk = None
         
-        # Use tool-calling response flow
-        async for event in self.llm.stream_response_with_tools(
-            self.conversation_history,
-            self._execute_tool
-        ):
-            event_type = event.get("type")
-            
-            if event_type == "text":
-                assistant_response += event.get("content", "")
-            
-            elif event_type == "tool_use":
-                print(f"🔧 Tool call: {event.get('name')} with {event.get('input')}")
+        # Stream Claude's response directly to TTS for minimum latency
+        # This uses the simple streaming method (no tools) for fastest response
+        async for chunk in self.llm.stream_response(self.conversation_history):
+            assistant_response += chunk
+            # Stream each chunk to TTS immediately
+            await self.tts.add_text(chunk)
+            if t_first_chunk is None:
+                t_first_chunk = time.time()
+                print(f"⏱️ Time to first chunk: {(t_first_chunk - t_llm_start)*1000:.0f}ms")
+        
+        t_llm_end = time.time()
         
         # Finalize response
         final_response = self._normalize_llm_output(assistant_response)
@@ -262,15 +293,21 @@ class DiscordVoicePipeline:
             })
             
             print(f"🤖 Garvis: {final_response}")
+            print(f"⏱️ LLM took {(t_llm_end - t_llm_start)*1000:.0f}ms")
             
             if self.on_transcript:
                 await self.on_transcript(final_response, "assistant", True)
             
-            # Send to TTS
-            await self.tts.add_text(final_response)
+            # Flush remaining TTS audio
+            t_tts_start = time.time()
             await self.tts.flush()
+            t_tts_end = time.time()
+            
+            print(f"⏱️ TTS flush took {(t_tts_end - t_tts_start)*1000:.0f}ms")
+            print(f"⏱️ Total response time: {(t_tts_end - t_start)*1000:.0f}ms")
         
         self.is_speaking = False
+        self._processing_response = False  # Allow new triggers
         await self._send_status()
     
     async def _handle_tts_audio(self, audio_bytes: bytes):

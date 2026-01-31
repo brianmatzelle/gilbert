@@ -24,9 +24,13 @@ ELEVENLABS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_turbo_v2_5")
 
 # Discord Bot Configuration
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
+# Set to "false" to stop Garvis from sending his responses to text chat
+DISCORD_SEND_TEXT_MESSAGES = os.getenv("DISCORD_SEND_TEXT_MESSAGES", "true").lower() == "true"
 
 # Claude Configuration
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+# For voice: claude-3-5-haiku-20241022 is MUCH faster (~500ms vs ~2000ms)
+# For quality: claude-sonnet-4-20250514 is smarter but slower
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-3-5-haiku-20241022")
 CLAUDE_SYSTEM_PROMPT = """You are Garvis, a helpful AI assistant integrated into an XR heads-up display.
 
 CRITICAL - RESPONSE LENGTH: This is a voice conversation. Keep responses EXTREMELY brief - 1-2 sentences max. No lists, no elaboration, no caveats. Just answer directly. If the user wants more, they'll ask. Single sentence answers are preferred.
@@ -70,6 +74,8 @@ DEEPGRAM_UTTERANCE_END_MS = int(os.getenv("DEEPGRAM_UTTERANCE_END_MS", "1000")) 
 DEEPGRAM_ENDPOINTING = int(os.getenv("DEEPGRAM_ENDPOINTING", "300"))  # endpoint detection threshold in ms - fires speech_final
 # Use speech_final (fast, 300ms) instead of UtteranceEnd (slow, 1000ms minimum) to trigger LLM response
 DEEPGRAM_USE_SPEECH_FINAL = os.getenv("DEEPGRAM_USE_SPEECH_FINAL", "true").lower() == "true"
+# Enable debug logging for Deepgram messages (shows all transcript events)
+DEEPGRAM_DEBUG = os.getenv("DEEPGRAM_DEBUG", "false").lower() == "true"
 
 # Audio processing intervals (seconds)
 AUDIO_PROCESS_INTERVAL = float(os.getenv("AUDIO_PROCESS_INTERVAL", "0.05"))  # how often to process audio (default was 0.1)

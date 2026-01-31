@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import discord
 from discord.ext import commands
 
-from config import DISCORD_BOT_TOKEN
+from config import DISCORD_BOT_TOKEN, DISCORD_SEND_TEXT_MESSAGES
 from .audio_sink import GarvisAudioSink
 from .voice_pipeline import DiscordVoicePipeline
 
@@ -199,6 +199,9 @@ class GarvisDiscordBot(commands.Bot):
             user = ctx.guild.get_member(user_id)
             name = user.display_name if user else f"User {user_id}"
             print(f"🔇 {name} stopped speaking")
+            # Trigger response immediately when user stops speaking (faster than Deepgram's speech_final)
+            if state.pipeline:
+                await state.pipeline.handle_user_silence()
         
         state.audio_sink = GarvisAudioSink(
             on_audio=on_audio,
@@ -296,7 +299,7 @@ class GarvisDiscordBot(commands.Bot):
     async def _handle_transcript(self, ctx, text: str, role: str, is_final: bool):
         """Handle transcript updates."""
         # Optionally send transcripts to the text channel
-        if is_final and role == "assistant":
+        if is_final and role == "assistant" and DISCORD_SEND_TEXT_MESSAGES:
             # Send assistant responses to the channel
             await ctx.send(f"🤖 **Garvis**: {text}")
     

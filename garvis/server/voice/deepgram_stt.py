@@ -15,6 +15,7 @@ from config import (
     DEEPGRAM_UTTERANCE_END_MS,
     DEEPGRAM_ENDPOINTING,
     DEEPGRAM_USE_SPEECH_FINAL,
+    DEEPGRAM_DEBUG,
 )
 
 
@@ -212,6 +213,10 @@ class DeepgramSTT:
                 is_final = data.get("is_final", False)
                 speech_final = data.get("speech_final", False)
                 
+                # Debug logging to diagnose transcription issues
+                if DEEPGRAM_DEBUG and transcript:
+                    print(f"🔍 Deepgram: '{transcript[:50]}...' is_final={is_final} speech_final={speech_final}")
+                
                 if transcript:
                     if is_final:
                         # Append to current transcript
@@ -226,17 +231,22 @@ class DeepgramSTT:
                 
                 # FAST PATH: Use speech_final (300ms) instead of UtteranceEnd (1000ms+)
                 # speech_final fires when endpointing detects a pause in speech
-                if DEEPGRAM_USE_SPEECH_FINAL and speech_final and self.current_transcript and not self._speech_final_fired:
-                    self._speech_final_fired = True
-                    await self.on_speech_end(self.current_transcript)
-                    self.current_transcript = ""
+                if DEEPGRAM_USE_SPEECH_FINAL and speech_final and not self._speech_final_fired:
+                    # Use current_transcript if available, otherwise use this message's transcript
+                    final_text = self.current_transcript or transcript
+                    if final_text:
+                        self._speech_final_fired = True
+                        await self.on_speech_end(final_text)
+                        self.current_transcript = ""
         
         elif msg_type == "UtteranceEnd":
             # User stopped speaking (fires after utterance_end_ms of silence)
-            # Only use this if we're not using speech_final for faster response
-            if not DEEPGRAM_USE_SPEECH_FINAL and self.current_transcript:
+            # This is a fallback if speech_final didn't fire or if USE_SPEECH_FINAL is disabled
+            if self.current_transcript and not self._speech_final_fired:
                 await self.on_speech_end(self.current_transcript)
                 self.current_transcript = ""
+            # Reset for next utterance
+            self._speech_final_fired = False
         
         elif msg_type == "SpeechStarted":
             # User started speaking - reset the speech_final flag
