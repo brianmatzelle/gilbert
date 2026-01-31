@@ -69,25 +69,81 @@ HTTP_MAX_CONNECTIONS = 100
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
 
 # ========== Voice Pipeline Performance Tuning ==========
-# Lower values = faster response but may cut off speech prematurely
-# Higher values = more accurate but slower response
+# These settings control response latency and accuracy
 
 # Deepgram STT Configuration
 DEEPGRAM_MODEL = os.getenv("DEEPGRAM_MODEL", "nova-2")  # nova-2 is fast and accurate
-DEEPGRAM_UTTERANCE_END_MS = int(os.getenv("DEEPGRAM_UTTERANCE_END_MS", "1000"))  # ms of silence before UtteranceEnd (min=1000, max=5000)
-DEEPGRAM_ENDPOINTING = int(os.getenv("DEEPGRAM_ENDPOINTING", "300"))  # endpoint detection threshold in ms - fires speech_final
-# Use speech_final (fast, 300ms) instead of UtteranceEnd (slow, 1000ms minimum) to trigger LLM response
+DEEPGRAM_UTTERANCE_END_MS = int(os.getenv("DEEPGRAM_UTTERANCE_END_MS", "1200"))  # ms of silence for UtteranceEnd fallback
+DEEPGRAM_ENDPOINTING = int(os.getenv("DEEPGRAM_ENDPOINTING", "500"))  # ms of silence before speech_final (triggers response)
+# Use speech_final (fast, endpointing ms) instead of UtteranceEnd (slow, 1000ms minimum) to trigger LLM response
 DEEPGRAM_USE_SPEECH_FINAL = os.getenv("DEEPGRAM_USE_SPEECH_FINAL", "true").lower() == "true"
 # Enable debug logging for Deepgram messages (shows all transcript events)
 DEEPGRAM_DEBUG = os.getenv("DEEPGRAM_DEBUG", "false").lower() == "true"
 
 # Audio processing intervals (seconds)
-AUDIO_PROCESS_INTERVAL = float(os.getenv("AUDIO_PROCESS_INTERVAL", "0.05"))  # how often to process audio (default was 0.1)
-AUDIO_SILENCE_THRESHOLD = float(os.getenv("AUDIO_SILENCE_THRESHOLD", "0.2"))  # silence before speech end callback (default was 0.3)
+AUDIO_PROCESS_INTERVAL = float(os.getenv("AUDIO_PROCESS_INTERVAL", "0.05"))  # how often to process audio
+
+# ========== Silero VAD Configuration ==========
+# Local voice activity detection for accurate speaking state
+# These settings control how speech start/end is detected
+
+# VAD probability threshold (0.0-1.0) - higher = more strict, fewer false positives
+VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.5"))
+
+# Minimum speech duration (ms) before triggering speech start callback
+# Prevents brief noises from triggering speaking state
+VAD_MIN_SPEECH_MS = int(os.getenv("VAD_MIN_SPEECH_MS", "250"))
+
+# Minimum silence duration (ms) before triggering speech end callback
+# 500ms is the developer consensus sweet spot - balances responsiveness with natural pauses
+VAD_MIN_SILENCE_MS = int(os.getenv("VAD_MIN_SILENCE_MS", "500"))
+
+# ========== Semantic Turn Detection ==========
+# Heuristics to detect incomplete utterances and prevent premature responses
+# These patterns indicate the user may not be done speaking
+
+# Trailing words that suggest more speech is coming (conjunctions, fillers, etc.)
+INCOMPLETE_UTTERANCE_PATTERNS = [
+    "but", "and", "or", "so", "because", "although", "however", "though",
+    "um", "uh", "umm", "uhh", "hmm", "er", "ah",
+    "like", "well", "actually", "basically", "honestly",
+    "i mean", "you know", "i think", "i guess",
+    "wait", "hold on", "let me",
+    "...",  # trailing ellipsis in transcript
+]
+
+# If utterance ends with these patterns, wait for extended silence before responding
+INCOMPLETE_UTTERANCE_EXTENDED_SILENCE_MS = int(os.getenv("INCOMPLETE_UTTERANCE_EXTENDED_SILENCE_MS", "1200"))
+
+# Silero VAD window size in samples (512 samples = 32ms at 16kHz)
+# This is fixed by the Silero model architecture
+VAD_WINDOW_SIZE_SAMPLES = 512
+
+# ========== Hardware Acceleration ==========
+# CUDA support for GPU-accelerated VAD inference (RTX GPUs)
+# Set to "false" to force CPU even if CUDA is available
+USE_CUDA = os.getenv("USE_CUDA", "true").lower() == "true"
+
+# Thread pool size for CPU-bound audio processing
+# This prevents blocking the asyncio event loop during:
+# - Audio format conversion (pydub/ffmpeg)
+# - VAD inference (when not using CUDA)
+# Set to 0 to use the default ThreadPoolExecutor (usually num_cores)
+AUDIO_THREAD_POOL_SIZE = int(os.getenv("AUDIO_THREAD_POOL_SIZE", "4"))
+
+# ========== Barge-in / Interruption ==========
+# Allow users to interrupt Garvis mid-response by speaking
+# When enabled, the current LLM/TTS response is cancelled and the new input is processed
+# This provides natural conversation flow but may cut off responses
+ENABLE_BARGE_IN = os.getenv("ENABLE_BARGE_IN", "true").lower() == "true"
+
+# Minimum time (ms) the bot must be speaking before barge-in is allowed
+# This prevents false barge-ins from echo/feedback when the response just starts
+# Set to 0 to allow immediate interruption
+BARGE_IN_MIN_SPEAK_MS = int(os.getenv("BARGE_IN_MIN_SPEAK_MS", "500"))
 
 # TTS streaming configuration  
 # Prebuffer: milliseconds of audio to accumulate before starting playback (smooths network jitter)
 TTS_PREBUFFER_MS = int(os.getenv("TTS_PREBUFFER_MS", "250"))
 # Legacy setting (no longer used with WebSocket TTS)
 TTS_BUFFER_THRESHOLD = int(os.getenv("TTS_BUFFER_THRESHOLD", "500"))
-

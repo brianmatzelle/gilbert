@@ -18,6 +18,7 @@ class ClaudeLLM:
     - Conversation history support
     - Tool calling support for content streaming
     - Configurable system prompt
+    - Cancellation support for barge-in interruption
     """
     
     def __init__(self, system_prompt: str = CLAUDE_SYSTEM_PROMPT):
@@ -28,6 +29,23 @@ class ClaudeLLM:
         self.system_prompt = system_prompt
         self.model = CLAUDE_MODEL
         self.tools = get_claude_tools()
+        
+        # Cancellation support for barge-in
+        self._cancel_requested = False
+    
+    def cancel(self):
+        """
+        Request cancellation of current stream.
+        
+        Called during barge-in when the user interrupts the bot.
+        The streaming loop checks this flag and exits early.
+        """
+        self._cancel_requested = True
+    
+    @property
+    def is_cancelled(self) -> bool:
+        """Check if cancellation was requested."""
+        return self._cancel_requested
     
     async def stream_response(
         self,
@@ -38,6 +56,8 @@ class ClaudeLLM:
         Stream a response from Claude given conversation history.
         NOTE: This method does NOT support tool calling. Use stream_response_with_tools for tool support.
         
+        Supports cancellation via cancel() for barge-in interruption.
+        
         Args:
             conversation_history: List of {"role": "user/assistant", "content": "..."}
             max_tokens: Maximum tokens in response
@@ -45,6 +65,9 @@ class ClaudeLLM:
         Yields:
             Text chunks as they're generated
         """
+        # Reset cancellation flag at start of new stream
+        self._cancel_requested = False
+        
         try:
             async with self.client.messages.stream(
                 model=self.model,
@@ -53,11 +76,16 @@ class ClaudeLLM:
                 messages=conversation_history
             ) as stream:
                 async for text in stream.text_stream:
+                    # Check for cancellation (barge-in)
+                    if self._cancel_requested:
+                        print("🛑 LLM stream cancelled (barge-in)")
+                        break
                     yield text
         
         except Exception as e:
-            print(f"❌ Claude error: {e}")
-            yield f"I apologize, but I encountered an error: {str(e)}"
+            if not self._cancel_requested:  # Don't log errors during intentional cancellation
+                print(f"❌ Claude error: {e}")
+                yield f"I apologize, but I encountered an error: {str(e)}"
     
     async def stream_response_with_tools(
         self,

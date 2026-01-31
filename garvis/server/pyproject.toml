@@ -22,6 +22,7 @@ dependencies = [
     "ultralytics>=8.3.0",  # YOLOv8/v11
     "torch>=2.0.0",
     "torchvision>=0.15.0",
+    "torchaudio>=2.0.0",  # Required for Silero VAD
     "deepface>=0.0.89",  # Face detection (RetinaFace backend)
     "tf-keras>=2.15.0",  # Required by DeepFace
     "opencv-python>=4.8.0",

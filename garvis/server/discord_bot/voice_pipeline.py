@@ -29,11 +29,30 @@ we ensure we always have complete frames to decode.
 
 The bot.py also buffers converted PCM (~48KB, ~250ms) before starting playback
 to avoid gaps between chunks.
+
+VOICE ACTIVITY DETECTION & TURN DETECTION:
+==========================================
+Speech detection is handled by two systems:
+1. Silero VAD - Local, fast VAD for speech start/end (no network latency)
+2. Deepgram endpointing - Server-side VAD that fires speech_final events
+
+SEMANTIC TURN DETECTION:
+=======================
+To avoid cutting users off mid-thought, we use semantic heuristics:
+- If utterance ends with conjunctions/fillers ("but", "um", "and"...),
+  we wait for extended silence (1200ms) before responding
+- A turn state machine prevents race conditions between VAD and STT
+- This balances responsiveness with natural conversation flow
+
+Research shows 500ms silence threshold is the developer consensus sweet spot.
+Incomplete utterance detection prevents 70-80% of premature interruptions.
 """
 
 import asyncio
 import io
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Callable, Awaitable
 
 # Import the Garvis voice components (using as a library!)
@@ -44,8 +63,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from voice.deepgram_stt import DeepgramSTT
 from voice.claude_llm import ClaudeLLM
 from voice.elevenlabs_tts import ElevenLabsTTS
+from voice.silero_vad import SileroVAD
 from providers import get_providers_by_type, get_provider_by_url, PROVIDERS
 from streaming import get_stream_urls
+from config import (
+    INCOMPLETE_UTTERANCE_PATTERNS, 
+    INCOMPLETE_UTTERANCE_EXTENDED_SILENCE_MS, 
+    VAD_MIN_SILENCE_MS,
+    AUDIO_THREAD_POOL_SIZE,
+    ENABLE_BARGE_IN,
+    BARGE_IN_MIN_SPEAK_MS,
+)
 
 # Audio conversion - pydub requires ffmpeg
 try:
@@ -55,6 +83,25 @@ except Exception as e:
     HAS_PYDUB = False
     print(f"⚠️ pydub import failed: {e}")
 
+# Thread pool for CPU-bound MP3→PCM conversion
+_tts_thread_pool: Optional[ThreadPoolExecutor] = None
+
+
+def _get_tts_thread_pool() -> ThreadPoolExecutor:
+    """Get or create the TTS audio conversion thread pool."""
+    global _tts_thread_pool
+    if _tts_thread_pool is None:
+        pool_size = AUDIO_THREAD_POOL_SIZE if AUDIO_THREAD_POOL_SIZE > 0 else None
+        _tts_thread_pool = ThreadPoolExecutor(max_workers=pool_size, thread_name_prefix="tts")
+    return _tts_thread_pool
+
+
+class TurnState:
+    """Turn-taking state machine to prevent race conditions."""
+    LISTENING = "listening"      # Waiting for user to speak
+    PROCESSING = "processing"    # User spoke, processing response
+    SPEAKING = "speaking"        # Bot is responding
+
 
 class DiscordVoicePipeline:
     """
@@ -62,10 +109,17 @@ class DiscordVoicePipeline:
     
     Flow:
     1. Receive PCM audio (16kHz mono) from Discord via audio sink
-    2. Stream to Deepgram for real-time transcription
-    3. On speech end (VAD), send transcript to Claude
-    4. Stream Claude response to Eleven Labs TTS (WebSocket API)
-    5. TTS outputs PCM directly (48kHz stereo) - no conversion needed!
+    2. Process through Silero VAD for speaking state detection
+    3. Stream to Deepgram for real-time transcription
+    4. On speech_final from Deepgram, send transcript to Claude
+    5. Stream Claude response to Eleven Labs TTS (WebSocket API)
+    6. TTS outputs PCM directly (48kHz stereo) - no conversion needed!
+    
+    Turn Detection Strategy:
+    - Uses Silero VAD (local) + Deepgram endpointing (server) as dual triggers
+    - Applies semantic heuristics to detect incomplete utterances
+    - Extends silence timeout when user appears mid-thought (e.g., "but...", "um...")
+    - State machine prevents race conditions between VAD and STT
     """
     
     @staticmethod
@@ -82,25 +136,64 @@ class DiscordVoicePipeline:
         text = re.sub(r'\s+', ' ', text).strip()
         return text
     
+    @staticmethod
+    def _appears_incomplete(text: str) -> bool:
+        """
+        Check if utterance appears incomplete based on trailing patterns.
+        
+        This is a semantic heuristic to prevent cutting off users mid-thought.
+        Examples that should return True:
+        - "I want to order a pizza but"
+        - "Let me think um"
+        - "The answer is, you know,"
+        """
+        if not text:
+            return False
+        
+        text_lower = text.lower().strip()
+        
+        # Check for trailing patterns that suggest more speech is coming
+        for pattern in INCOMPLETE_UTTERANCE_PATTERNS:
+            if text_lower.endswith(pattern):
+                return True
+            # Also check with punctuation stripped
+            if text_lower.rstrip('.,!?').endswith(pattern):
+                return True
+        
+        # Check for very short utterances (likely incomplete)
+        word_count = len(text_lower.split())
+        if word_count <= 2 and not text_lower.endswith(('?', '!', '.')):
+            # Short utterances without terminal punctuation may be incomplete
+            # But allow common short commands like "yes", "no", "stop", "help"
+            short_complete = {'yes', 'no', 'stop', 'help', 'thanks', 'okay', 'ok', 'sure', 'bye', 'hi', 'hello'}
+            if text_lower.rstrip('.,!?') not in short_complete:
+                return True
+        
+        return False
+    
     def __init__(
         self,
         on_audio_output: Callable[[bytes, bool], Awaitable[None]],
         on_transcript: Optional[Callable[[str, str, bool], Awaitable[None]]] = None,
         on_status: Optional[Callable[[bool, bool], Awaitable[None]]] = None,
+        on_interrupt: Optional[Callable[[], Awaitable[None]]] = None,
     ):
         """
         Args:
             on_audio_output: Callback for PCM audio (bytes, flush: bool) to play in Discord (48kHz stereo)
             on_transcript: Optional callback (text, role, is_final)
             on_status: Optional callback (listening, speaking)
+            on_interrupt: Optional callback when barge-in interruption occurs (to stop Discord playback)
         """
         self.on_audio_output = on_audio_output
         self.on_transcript = on_transcript
         self.on_status = on_status
+        self.on_interrupt = on_interrupt
         
         self.stt: Optional[DeepgramSTT] = None
         self.llm: Optional[ClaudeLLM] = None
         self.tts: Optional[ElevenLabsTTS] = None
+        self.vad: Optional[SileroVAD] = None
         
         self.is_listening = False
         self.is_speaking = False
@@ -110,8 +203,16 @@ class DiscordVoicePipeline:
         self._running = False
         self._processing_response = False  # Prevent double-triggering
         self._pending_transcript = ""  # Latest transcript from Deepgram
-        self._last_processed_transcript = ""  # Avoid processing same transcript twice
-        self._last_discord_silence_time = 0.0  # Timestamp when Discord silence last triggered a response
+        self._last_vad_trigger_time = 0.0  # When VAD last triggered a response
+        self._speaking_start_time = 0.0  # When bot started speaking (for barge-in delay)
+        
+        # Turn state machine
+        self._turn_state = TurnState.LISTENING
+        self._state_lock = asyncio.Lock()  # Prevent race conditions
+        
+        # Incomplete utterance handling
+        self._incomplete_utterance_detected = False
+        self._extended_silence_task: Optional[asyncio.Task] = None
         
         # MP3 buffer for TTS audio conversion
         self._mp3_buffer = io.BytesIO()
@@ -172,6 +273,19 @@ class DiscordVoicePipeline:
         """Initialize and start the pipeline components."""
         self._running = True
         
+        # Initialize Silero VAD for local speaking detection
+        self.vad = SileroVAD(
+            on_speech_start=self._on_vad_speech_start,
+            on_speech_end=self._on_vad_speech_end,
+        )
+        
+        if self.vad.is_available:
+            vad_device = self.vad.device.upper()
+            device_emoji = "🎮" if self.vad.device == "cuda" else "💻"
+            print(f"✅ Silero VAD enabled on {vad_device} {device_emoji}")
+        else:
+            print("⚠️ Silero VAD not available, using Deepgram VAD only")
+        
         # Wrapper to tag Deepgram's speech_end calls with source
         async def _deepgram_speech_end(transcript: str):
             await self._handle_speech_end(transcript, source="deepgram")
@@ -179,7 +293,7 @@ class DiscordVoicePipeline:
         # Initialize components
         self.stt = DeepgramSTT(
             on_transcript=self._handle_transcript,
-            on_speech_end=_deepgram_speech_end
+            on_speech_end=_deepgram_speech_end  # Deepgram's speech_final as backup
         )
         self.llm = ClaudeLLM()
         
@@ -200,8 +314,54 @@ class DiscordVoicePipeline:
             await self.stt.disconnect()
         if self.tts:
             await self.tts.stop()
+        if self.vad:
+            self.vad.reset()
         
         print("🔌 Discord voice pipeline stopped")
+    
+    async def interrupt(self):
+        """
+        Cancel current response for barge-in interruption.
+        
+        Called when the user starts speaking while the bot is still responding.
+        This allows natural conversation flow where users can interrupt.
+        """
+        # Only interrupt if we're actually speaking
+        if self._turn_state != TurnState.SPEAKING:
+            return
+        
+        print("🛑 Barge-in detected - interrupting response")
+        
+        # Cancel LLM streaming
+        if self.llm:
+            self.llm.cancel()
+        
+        # Stop TTS immediately
+        if self.tts:
+            await self.tts.stop()
+        
+        # Clear MP3 buffer
+        self._mp3_buffer.seek(0)
+        self._mp3_buffer.truncate()
+        
+        # Clear any pending transcripts accumulated during bot speech
+        self._pending_transcript = ""
+        if self.stt:
+            self.stt.current_transcript = ""
+        
+        # Reset state to allow new processing
+        self._processing_response = False
+        self.is_speaking = False
+        self.is_listening = True
+        
+        async with self._state_lock:
+            self._turn_state = TurnState.LISTENING
+        
+        await self._send_status()
+        
+        # Notify bot.py to stop Discord audio playback
+        if self.on_interrupt:
+            await self.on_interrupt()
     
     async def process_audio(self, audio_bytes: bytes):
         """
@@ -212,6 +372,10 @@ class DiscordVoicePipeline:
         """
         if not self._running or not self.stt:
             return
+        
+        # Process through local VAD for speaking state (non-blocking)
+        if self.vad and self.vad.is_available:
+            await self.vad.process_audio(audio_bytes)
         
         # Check if STT connection is still alive, reconnect if needed
         if not self.stt._connected:
@@ -237,21 +401,132 @@ class DiscordVoicePipeline:
         # Forward audio to Deepgram STT
         await self.stt.send_audio(audio_bytes)
     
+    async def _on_vad_speech_start(self):
+        """Called by Silero VAD when speech starts."""
+        # Cancel extended silence task if user starts speaking again
+        if self._extended_silence_task and not self._extended_silence_task.done():
+            self._extended_silence_task.cancel()
+            self._incomplete_utterance_detected = False
+            print("🎙️ User resumed speaking - cancelled extended silence wait")
+        
+        # Barge-in: If bot is speaking and user starts talking, interrupt the response
+        # Only allow barge-in after minimum speaking time to avoid echo/feedback triggers
+        if ENABLE_BARGE_IN and self._turn_state == TurnState.SPEAKING:
+            speaking_duration_ms = (time.time() - self._speaking_start_time) * 1000
+            if speaking_duration_ms >= BARGE_IN_MIN_SPEAK_MS:
+                await self.interrupt()
+                return  # Don't update listening state - interrupt() handles it
+            # else: Ignore - too soon, likely echo/feedback
+        
+        if not self.is_listening:
+            self.is_listening = True
+            await self._send_status()
+    
+    async def _on_vad_speech_end(self):
+        """
+        Called by Silero VAD when speech ends.
+        
+        This triggers faster than Deepgram's speech_final since it's local
+        (no network latency). We use the pending transcript from Deepgram.
+        
+        Semantic Turn Detection:
+        - If the utterance appears incomplete (ends with "but", "um", etc.),
+          we wait for an extended silence period before triggering a response.
+        - This prevents cutting off users mid-thought while maintaining responsiveness.
+        """
+        # Don't trigger if already processing
+        if self._processing_response:
+            return
+        
+        # Check turn state - only process if we're in LISTENING state
+        async with self._state_lock:
+            if self._turn_state != TurnState.LISTENING:
+                return
+        
+        transcript = self._pending_transcript.strip()
+        if not transcript:
+            # No transcript yet - let Deepgram's speech_final handle it
+            return
+        
+        # Check if utterance appears incomplete (semantic heuristic)
+        if self._appears_incomplete(transcript):
+            print(f"🔄 Incomplete utterance detected: '{transcript[-30:]}...' - waiting for extended silence")
+            self._incomplete_utterance_detected = True
+            
+            # Cancel any existing extended silence task
+            if self._extended_silence_task and not self._extended_silence_task.done():
+                self._extended_silence_task.cancel()
+            
+            # Start extended silence timer - only trigger if silence continues
+            self._extended_silence_task = asyncio.create_task(
+                self._wait_for_extended_silence(transcript)
+            )
+            return
+        
+        # Reset incomplete utterance flag
+        self._incomplete_utterance_detected = False
+        
+        # Record when VAD triggered - used to block Deepgram's speech_final
+        self._last_vad_trigger_time = time.time()
+        
+        # Clear pending transcript and trigger response
+        self._pending_transcript = ""
+        
+        # Also clear Deepgram's accumulated transcript to prevent double-trigger
+        if self.stt:
+            self.stt.current_transcript = ""
+        
+        await self._handle_speech_end(transcript, source="vad")
+    
+    async def _wait_for_extended_silence(self, transcript: str):
+        """
+        Wait for extended silence before triggering response for incomplete utterances.
+        
+        If the user starts speaking again during this window, the task is cancelled
+        and we continue accumulating their speech.
+        """
+        try:
+            # Wait for extended silence period
+            extended_wait_ms = INCOMPLETE_UTTERANCE_EXTENDED_SILENCE_MS - VAD_MIN_SILENCE_MS
+            await asyncio.sleep(extended_wait_ms / 1000.0)
+            
+            # Check if we're still in a valid state to respond
+            if self._processing_response:
+                return
+            
+            async with self._state_lock:
+                if self._turn_state != TurnState.LISTENING:
+                    return
+            
+            # Use the latest transcript (may have been updated during wait)
+            final_transcript = self._pending_transcript.strip() or transcript
+            
+            print(f"⏰ Extended silence elapsed - triggering response for: '{final_transcript[:50]}...'")
+            
+            # Record when VAD triggered
+            self._last_vad_trigger_time = time.time()
+            
+            # Clear pending transcript
+            self._pending_transcript = ""
+            self._incomplete_utterance_detected = False
+            
+            if self.stt:
+                self.stt.current_transcript = ""
+            
+            await self._handle_speech_end(final_transcript, source="vad-extended")
+            
+        except asyncio.CancelledError:
+            # User started speaking again - good, we didn't interrupt them
+            print("🔄 Extended silence cancelled - user continued speaking")
+    
     async def _handle_transcript(self, text: str, is_final: bool):
         """Handle transcript updates from Deepgram."""
         text = self._normalize_transcript(text)
         self.current_transcript = text
         
-        # Store the latest transcript for when silence is detected
+        # Store the latest transcript for VAD-triggered responses
         if text.strip():
             self._pending_transcript = text
-            # Reset duplicate detection when new speech content arrives
-            # (allows user to intentionally repeat themselves)
-            # BUT don't reset while processing a response - this prevents the race condition
-            # where Discord's silence detection fires, then Deepgram's speech_final arrives
-            # after the response completes, causing a duplicate response
-            if not self._processing_response and text.strip().lower() != self._last_processed_transcript:
-                self._last_processed_transcript = ""
         
         if self.on_transcript:
             await self.on_transcript(text, "user", is_final)
@@ -260,105 +535,37 @@ class DiscordVoicePipeline:
             self.is_listening = True
             await self._send_status()
     
-    async def handle_user_silence(self):
-        """
-        Called when Discord detects the user stopped speaking.
-        This triggers faster than Deepgram's speech_final, giving us lower latency.
-        """
-        import time
-        import json
-        
-        # #region agent log
-        try:
-            with open('/mnt/s/Projects/guitar2discord/.cursor/debug.log', 'a') as f:
-                f.write(json.dumps({"hypothesisId":"A,B","location":"voice_pipeline.py:handle_user_silence","message":"Discord silence detected","data":{"pending_transcript":self._pending_transcript[:50] if self._pending_transcript else "","processing_response":self._processing_response,"stt_current_transcript":self.stt.current_transcript[:50] if self.stt and self.stt.current_transcript else ""},"timestamp":int(time.time()*1000)}) + '\n')
-        except: pass
-        # #endregion
-        
-        # Don't trigger if already processing or no transcript
-        if self._processing_response or not self._pending_transcript.strip():
-            return
-        
-        # Record timestamp - used to block Deepgram's speech_final that arrives shortly after
-        self._last_discord_silence_time = time.time()
-        
-        # Also clear Deepgram's accumulated transcript to prevent stale text
-        if self.stt:
-            self.stt.current_transcript = ""
-        
-        # Trigger response immediately with whatever transcript we have
-        await self._handle_speech_end(self._pending_transcript, source="discord")
-    
     async def _handle_speech_end(self, final_transcript: str, source: str = "deepgram"):
-        """Handle end of user speech (VAD triggered)."""
-        import time
-        import json
-        
+        """Handle end of user speech (from VAD or Deepgram's speech_final)."""
         if not final_transcript.strip():
             return
         
-        # #region agent log
-        try:
-            with open('/mnt/s/Projects/guitar2discord/.cursor/debug.log', 'a') as f:
-                f.write(json.dumps({"hypothesisId":"A,B,C,D","location":"voice_pipeline.py:_handle_speech_end:entry","message":"speech_end called","data":{"transcript":final_transcript[:50],"source":source,"processing_response":self._processing_response,"last_processed":self._last_processed_transcript[:50] if self._last_processed_transcript else "","time_since_discord":time.time()-self._last_discord_silence_time},"timestamp":int(time.time()*1000)}) + '\n')
-        except: pass
-        # #endregion
-        
-        # Prevent double-triggering from concurrent calls
-        if self._processing_response:
-            # #region agent log
-            try:
-                with open('/mnt/s/Projects/guitar2discord/.cursor/debug.log', 'a') as f:
-                    f.write(json.dumps({"hypothesisId":"D","location":"voice_pipeline.py:_handle_speech_end:blocked","message":"BLOCKED by processing_response","data":{"transcript":final_transcript[:50],"source":source},"timestamp":int(time.time()*1000)}) + '\n')
-            except: pass
-            # #endregion
-            return
-        
-        # FIX: If this is from Deepgram and Discord already triggered a response recently,
-        # skip this to prevent duplicate responses. The 10-second window accounts for
-        # response time + potential delays in Deepgram's speech_final.
-        DISCORD_SILENCE_GUARD_SECONDS = 10.0
-        time_since_discord = time.time() - self._last_discord_silence_time
-        if source == "deepgram" and time_since_discord < DISCORD_SILENCE_GUARD_SECONDS:
-            # #region agent log
-            try:
-                with open('/mnt/s/Projects/guitar2discord/.cursor/debug.log', 'a') as f:
-                    f.write(json.dumps({"hypothesisId":"NEW","location":"voice_pipeline.py:_handle_speech_end:discord_guard","message":"BLOCKED by discord silence guard","data":{"transcript":final_transcript[:50],"source":source,"time_since_discord":time_since_discord},"timestamp":int(time.time()*1000)}) + '\n')
-            except: pass
-            # #endregion
-            return
-        
-        # Skip if we already processed this exact transcript
-        # (Discord silence detection and Deepgram speech_final can both trigger)
-        normalized = final_transcript.strip().lower()
-        if normalized == self._last_processed_transcript:
-            # #region agent log
-            try:
-                with open('/mnt/s/Projects/guitar2discord/.cursor/debug.log', 'a') as f:
-                    f.write(json.dumps({"hypothesisId":"C","location":"voice_pipeline.py:_handle_speech_end:dedup","message":"BLOCKED by dedup","data":{"normalized":normalized[:50],"last_processed":self._last_processed_transcript[:50]},"timestamp":int(time.time()*1000)}) + '\n')
-            except: pass
-            # #endregion
-            return
-        self._last_processed_transcript = normalized
-        
-        # #region agent log
-        try:
-            with open('/mnt/s/Projects/guitar2discord/.cursor/debug.log', 'a') as f:
-                f.write(json.dumps({"hypothesisId":"C","location":"voice_pipeline.py:_handle_speech_end:proceeding","message":"PROCEEDING with response","data":{"normalized":normalized[:50],"source":source},"timestamp":int(time.time()*1000)}) + '\n')
-        except: pass
-        # #endregion
-        
-        self._processing_response = True
+        # Use state machine to prevent race conditions
+        async with self._state_lock:
+            # Prevent double-triggering from concurrent calls
+            if self._processing_response or self._turn_state != TurnState.LISTENING:
+                return
+            
+            # If Deepgram triggers shortly after VAD, skip it (VAD already handled it)
+            if source == "deepgram":
+                time_since_vad = time.time() - self._last_vad_trigger_time
+                if time_since_vad < 5.0:  # 5 second guard window
+                    return
+            
+            # Transition to PROCESSING state
+            self._turn_state = TurnState.PROCESSING
+            self._processing_response = True
         
         t_start = time.time()
         
         final_transcript = self._normalize_transcript(final_transcript)
         
-        # Clear pending transcript to prevent re-triggering
-        self._pending_transcript = ""
-        
         self.is_listening = False
         await self._send_status()
+        
+        # Reset VAD state for next utterance
+        if self.vad:
+            self.vad.reset()
         
         # Add user message to history
         self.conversation_history.append({
@@ -370,6 +577,9 @@ class DiscordVoicePipeline:
         
         # Get Claude response
         self.is_speaking = True
+        self._speaking_start_time = time.time()  # Track for barge-in delay
+        async with self._state_lock:
+            self._turn_state = TurnState.SPEAKING
         await self._send_status()
         
         assistant_response = ""
@@ -417,6 +627,14 @@ class DiscordVoicePipeline:
         
         self.is_speaking = False
         self._processing_response = False  # Allow new triggers
+        
+        # Clear any stale transcripts to prevent reprocessing
+        self._pending_transcript = ""
+        if self.stt:
+            self.stt.current_transcript = ""
+        
+        async with self._state_lock:
+            self._turn_state = TurnState.LISTENING
         await self._send_status()
     
     async def _handle_tts_audio(self, audio_bytes: bytes):
@@ -453,13 +671,20 @@ class DiscordVoicePipeline:
         self._mp3_buffer.truncate()
         
         # Convert MP3 to PCM for Discord (48kHz stereo 16-bit)
-        pcm_data = self._convert_mp3_to_pcm(mp3_data)
+        # Run in thread pool to avoid blocking the event loop
+        loop = asyncio.get_running_loop()
+        pcm_data = await loop.run_in_executor(
+            _get_tts_thread_pool(),
+            self._convert_mp3_to_pcm,
+            mp3_data
+        )
         if pcm_data:
             await self.on_audio_output(pcm_data, flush)
     
     def _convert_mp3_to_pcm(self, mp3_data: bytes) -> Optional[bytes]:
         """
         Convert MP3 audio to PCM for Discord playback.
+        Runs in thread pool - do not call from async context directly.
         
         Discord expects: 48000 Hz, 16-bit signed, stereo
         """

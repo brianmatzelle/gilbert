@@ -3,11 +3,18 @@ Discord audio sink for capturing user voice input.
 
 Receives Opus-encoded audio from Discord, decodes it, and resamples to 16kHz mono
 for the Deepgram STT pipeline.
+
+THREADING MODEL:
+===============
+Audio format conversion (48kHz stereo → 16kHz mono) is CPU-bound work.
+We use asyncio.to_thread() to run pydub conversions in a thread pool,
+keeping the asyncio event loop responsive for I/O operations.
 """
 
 import asyncio
 import io
 import struct
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Awaitable, Optional, Dict
 from collections import defaultdict
 
@@ -18,18 +25,7 @@ from discord.sinks import Sink
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from config import AUDIO_PROCESS_INTERVAL, AUDIO_SILENCE_THRESHOLD
-
-def _run_async_from_thread(coro, loop):
-    """Safely run an async coroutine from a sync thread context."""
-    if loop and loop.is_running():
-        asyncio.run_coroutine_threadsafe(coro, loop)
-    else:
-        # Fallback: try to create a new loop (not ideal but better than crashing)
-        try:
-            asyncio.run(coro)
-        except RuntimeError:
-            pass  # No event loop available, skip the callback
+from config import AUDIO_PROCESS_INTERVAL, AUDIO_THREAD_POOL_SIZE
 
 # Audio conversion - need pydub for format conversion
 # Note: pydub also requires ffmpeg to be installed on the system
@@ -40,6 +36,19 @@ except Exception as e:
     HAS_PYDUB = False
     print(f"⚠️ pydub import failed: {e} - audio conversion will be limited")
 
+# Thread pool for CPU-bound audio conversion (shared across instances)
+_audio_thread_pool: Optional[ThreadPoolExecutor] = None
+
+
+def _get_audio_thread_pool() -> ThreadPoolExecutor:
+    """Get or create the audio processing thread pool."""
+    global _audio_thread_pool
+    if _audio_thread_pool is None:
+        pool_size = AUDIO_THREAD_POOL_SIZE if AUDIO_THREAD_POOL_SIZE > 0 else None
+        _audio_thread_pool = ThreadPoolExecutor(max_workers=pool_size, thread_name_prefix="audio")
+        print(f"🧵 Audio thread pool created (workers={pool_size or 'default'})")
+    return _audio_thread_pool
+
 
 class GarvisAudioSink(Sink):
     """
@@ -47,39 +56,32 @@ class GarvisAudioSink(Sink):
     
     Converts Discord's 48kHz stereo PCM to 16kHz mono PCM for Deepgram.
     Accumulates audio from speaking users and fires callbacks for the voice pipeline.
+    
+    Threading: Audio conversion runs in a thread pool to avoid blocking the event loop.
+    
+    Note: Speaking detection is handled by Silero VAD in the voice pipeline,
+    not by timestamp-based silence detection here. This sink just forwards audio.
     """
     
     def __init__(
         self,
         on_audio: Callable[[bytes, int], Awaitable[None]],
-        on_speaking_start: Optional[Callable[[int], Awaitable[None]]] = None,
-        on_speaking_end: Optional[Callable[[int], Awaitable[None]]] = None,
         target_user_id: Optional[int] = None,
         event_loop: Optional[asyncio.AbstractEventLoop] = None,
     ):
         """
         Args:
             on_audio: Async callback (pcm_bytes, user_id) for 16kHz mono PCM
-            on_speaking_start: Optional callback when a user starts speaking
-            on_speaking_end: Optional callback when a user stops speaking
             target_user_id: If set, only process audio from this user
             event_loop: The asyncio event loop to use for callbacks
         """
         super().__init__()
         self.on_audio = on_audio
-        self.on_speaking_start = on_speaking_start
-        self.on_speaking_end = on_speaking_end
         self.target_user_id = target_user_id
         self._loop = event_loop
         
-        # Track speaking state per user
-        self._speaking: Dict[int, bool] = defaultdict(bool)
-        
         # Audio buffer per user (accumulate before resampling)
         self._buffers: Dict[int, io.BytesIO] = defaultdict(io.BytesIO)
-        
-        # Timestamp of last audio per user (for silence detection)
-        self._last_audio_time: Dict[int, float] = {}
         
         # Background task for processing audio
         self._process_task: Optional[asyncio.Task] = None
@@ -100,20 +102,8 @@ class GarvisAudioSink(Sink):
         if self.target_user_id and user_id != self.target_user_id:
             return
         
-        # Track speaking state
-        was_speaking = self._speaking[user_id]
-        self._speaking[user_id] = True
-        
-        if not was_speaking and self.on_speaking_start:
-            # Called from thread - use thread-safe method
-            _run_async_from_thread(self.on_speaking_start(user_id), self._loop)
-        
         # Store audio in buffer
         self._buffers[user_id].write(data)
-        
-        # Update last audio timestamp
-        import time
-        self._last_audio_time[user_id] = time.time()
     
     async def start_processing(self):
         """Start the background audio processing loop."""
@@ -136,17 +126,12 @@ class GarvisAudioSink(Sink):
     
     async def _process_loop(self):
         """Background loop that processes accumulated audio."""
-        import time
-        # Use configurable values for performance tuning
-        # Lower values = faster response but more CPU usage
-        SILENCE_THRESHOLD = AUDIO_SILENCE_THRESHOLD  # seconds of silence before considering speech ended
+        # Use configurable value for performance tuning
         PROCESS_INTERVAL = AUDIO_PROCESS_INTERVAL  # how often to process accumulated audio
         
         while self._running:
             try:
                 await asyncio.sleep(PROCESS_INTERVAL)
-                
-                current_time = time.time()
                 
                 for user_id in list(self._buffers.keys()):
                     buffer = self._buffers[user_id]
@@ -160,16 +145,15 @@ class GarvisAudioSink(Sink):
                         buffer.truncate()
                         
                         # Convert from 48kHz stereo to 16kHz mono
-                        converted = self._convert_audio(audio_data)
+                        # Run in thread pool to avoid blocking event loop
+                        loop = asyncio.get_running_loop()
+                        converted = await loop.run_in_executor(
+                            _get_audio_thread_pool(),
+                            self._convert_audio,
+                            audio_data
+                        )
                         if converted:
                             await self.on_audio(converted, user_id)
-                    
-                    # Check for silence (speech ended)
-                    last_time = self._last_audio_time.get(user_id, current_time)
-                    if self._speaking[user_id] and (current_time - last_time) > SILENCE_THRESHOLD:
-                        self._speaking[user_id] = False
-                        if self.on_speaking_end:
-                            await self.on_speaking_end(user_id)
             
             except asyncio.CancelledError:
                 break
@@ -240,5 +224,3 @@ class GarvisAudioSink(Sink):
         for buffer in self._buffers.values():
             buffer.close()
         self._buffers.clear()
-        self._speaking.clear()
-        self._last_audio_time.clear()

@@ -17,9 +17,42 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import discord
 from discord.ext import commands
 
-from config import DISCORD_BOT_TOKEN, DISCORD_SEND_TEXT_MESSAGES
+from config import DISCORD_BOT_TOKEN, DISCORD_SEND_TEXT_MESSAGES, USE_CUDA, AUDIO_THREAD_POOL_SIZE, ENABLE_BARGE_IN
 from .audio_sink import GarvisAudioSink
 from .voice_pipeline import DiscordVoicePipeline
+
+
+def _log_hardware_config():
+    """Log hardware acceleration and threading configuration at startup."""
+    print("\n" + "=" * 50)
+    print("🔧 Hardware Configuration")
+    print("=" * 50)
+    
+    # Check CUDA availability
+    try:
+        import torch
+        if torch.cuda.is_available():
+            device_name = torch.cuda.get_device_name(0)
+            cuda_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            print(f"🎮 GPU: {device_name} ({cuda_mem:.1f} GB)")
+            if USE_CUDA:
+                print("   → CUDA enabled for VAD inference")
+            else:
+                print("   → CUDA available but disabled (USE_CUDA=false)")
+        else:
+            print("💻 GPU: None detected (using CPU)")
+    except ImportError:
+        print("💻 GPU: PyTorch not installed (using CPU)")
+    
+    # Thread pool configuration
+    pool_desc = f"{AUDIO_THREAD_POOL_SIZE} workers" if AUDIO_THREAD_POOL_SIZE > 0 else "auto"
+    print(f"🧵 Thread pool: {pool_desc}")
+    
+    # Barge-in configuration
+    barge_in_status = "enabled" if ENABLE_BARGE_IN else "disabled"
+    print(f"🛑 Barge-in: {barge_in_status}")
+    
+    print("=" * 50 + "\n")
 
 
 class VoiceState:
@@ -157,6 +190,13 @@ class GarvisDiscordBot(commands.Bot):
             
             if state.pipeline:
                 status_parts.append("🎤 Voice pipeline: **Active**")
+                
+                # Show VAD status
+                if state.pipeline.vad and state.pipeline.vad.is_available:
+                    status_parts.append("🎙️ Silero VAD: **Enabled**")
+                else:
+                    status_parts.append("🎙️ Silero VAD: **Not available**")
+                
                 if state.pipeline.is_listening:
                     status_parts.append("👂 Currently: **Listening**")
                 elif state.pipeline.is_speaking:
@@ -176,11 +216,12 @@ class GarvisDiscordBot(commands.Bot):
     async def _start_listening(self, state: VoiceState, ctx: commands.Context):
         """Start the voice pipeline and audio capture."""
         
-        # Create the voice pipeline
+        # Create the voice pipeline with barge-in support
         state.pipeline = DiscordVoicePipeline(
             on_audio_output=lambda audio, flush: self._play_audio(state, audio, flush),
             on_transcript=lambda text, role, final: self._handle_transcript(ctx, text, role, final),
-            on_status=lambda listening, speaking: self._handle_status(ctx, listening, speaking)
+            on_status=lambda listening, speaking: self._handle_status(ctx, listening, speaking),
+            on_interrupt=lambda: self._handle_interrupt(state),  # Barge-in callback
         )
         
         # Start the pipeline
@@ -191,23 +232,8 @@ class GarvisDiscordBot(commands.Bot):
             if state.pipeline:
                 await state.pipeline.process_audio(pcm_bytes)
         
-        async def on_speaking_start(user_id: int):
-            user = ctx.guild.get_member(user_id)
-            name = user.display_name if user else f"User {user_id}"
-            print(f"👂 {name} started speaking")
-        
-        async def on_speaking_end(user_id: int):
-            user = ctx.guild.get_member(user_id)
-            name = user.display_name if user else f"User {user_id}"
-            print(f"🔇 {name} stopped speaking")
-            # Trigger response immediately when user stops speaking (faster than Deepgram's speech_final)
-            if state.pipeline:
-                await state.pipeline.handle_user_silence()
-        
         state.audio_sink = GarvisAudioSink(
             on_audio=on_audio,
-            on_speaking_start=on_speaking_start,
-            on_speaking_end=on_speaking_end,
             target_user_id=state.target_user_id,
             event_loop=asyncio.get_running_loop()
         )
@@ -317,6 +343,24 @@ class GarvisDiscordBot(commands.Bot):
         """Handle status updates."""
         pass  # Could show typing indicator or update presence
     
+    async def _handle_interrupt(self, state: VoiceState):
+        """
+        Handle barge-in interruption.
+        
+        Called when the user starts speaking while the bot is responding.
+        Stops Discord audio playback and clears the audio buffer.
+        """
+        # Stop any current Discord audio playback
+        if state.voice_client and state.voice_client.is_playing():
+            state.voice_client.stop()
+        
+        # Clear the audio buffer
+        async with state._playback_lock:
+            state._audio_buffer.seek(0)
+            state._audio_buffer.truncate()
+        
+        print("🛑 Discord playback stopped (barge-in)")
+    
     async def on_ready(self):
         """Called when the bot is ready."""
         print(f"🤖 Garvis Discord Bot is ready!")
@@ -337,6 +381,9 @@ def run_bot():
         print("   Add it to your server/.env file:")
         print("   DISCORD_BOT_TOKEN=your_bot_token_here")
         return
+    
+    # Log hardware configuration at startup
+    _log_hardware_config()
     
     bot = GarvisDiscordBot()
     bot.run(DISCORD_BOT_TOKEN)

@@ -27,6 +27,10 @@ class DeepgramSTT:
     - Real-time transcription streaming
     - Built-in Voice Activity Detection (VAD)
     - Utterance end detection for conversation flow
+    
+    The speech_final event (controlled by endpointing parameter) is used
+    to trigger response generation. This is more reliable than timestamp-based
+    silence detection as it's trained on actual speech patterns.
     """
     
     DEEPGRAM_WS_URL = "wss://api.deepgram.com/v1/listen"
@@ -59,8 +63,8 @@ class DeepgramSTT:
             raise ValueError("DEEPGRAM_API_KEY is not set")
         
         # Build WebSocket URL with query parameters
-        # Performance tuning: utterance_end_ms and endpointing control response latency
-        # Lower values = faster response but may cut off speech prematurely
+        # endpointing controls how long a pause triggers speech_final (response)
+        # utterance_end_ms is a fallback for UtteranceEnd event
         params = {
             "model": DEEPGRAM_MODEL,
             "language": "en-US",
@@ -70,8 +74,8 @@ class DeepgramSTT:
             "sample_rate": "16000",
             "vad_events": "true",
             "interim_results": "true",
-            "utterance_end_ms": str(DEEPGRAM_UTTERANCE_END_MS),  # Reduced from 1000ms for faster response
-            "endpointing": str(DEEPGRAM_ENDPOINTING),  # Reduced from 300ms for faster endpoint detection
+            "utterance_end_ms": str(DEEPGRAM_UTTERANCE_END_MS),
+            "endpointing": str(DEEPGRAM_ENDPOINTING),
         }
         
         query_string = "&".join(f"{k}={v}" for k, v in params.items())
@@ -213,7 +217,7 @@ class DeepgramSTT:
                 is_final = data.get("is_final", False)
                 speech_final = data.get("speech_final", False)
                 
-                # Debug logging to diagnose transcription issues
+                # Debug logging (only when enabled)
                 if DEEPGRAM_DEBUG and transcript:
                     print(f"🔍 Deepgram: '{transcript[:50]}...' is_final={is_final} speech_final={speech_final}")
                 
@@ -229,18 +233,10 @@ class DeepgramSTT:
                     display_text = self.current_transcript if is_final else transcript
                     await self.on_transcript(display_text, is_final)
                 
-                # FAST PATH: Use speech_final (300ms) instead of UtteranceEnd (1000ms+)
-                # speech_final fires when endpointing detects a pause in speech
+                # Use speech_final to trigger response generation
+                # This fires when Deepgram's endpointing detects a pause in speech
                 if DEEPGRAM_USE_SPEECH_FINAL and speech_final and not self._speech_final_fired:
-                    # Use current_transcript if available, otherwise use this message's transcript
                     final_text = self.current_transcript or transcript
-                    # #region agent log
-                    import json
-                    try:
-                        with open('/mnt/s/Projects/guitar2discord/.cursor/debug.log', 'a') as f:
-                            f.write(json.dumps({"hypothesisId":"A,B","location":"deepgram_stt.py:speech_final","message":"speech_final firing","data":{"final_text":final_text[:50] if final_text else "","current_transcript":self.current_transcript[:50] if self.current_transcript else "","speech_final_fired_before":self._speech_final_fired},"timestamp":int(time.time()*1000)}) + '\n')
-                    except: pass
-                    # #endregion
                     if final_text:
                         self._speech_final_fired = True
                         await self.on_speech_end(final_text)
@@ -257,13 +253,6 @@ class DeepgramSTT:
         
         elif msg_type == "SpeechStarted":
             # User started speaking - reset the speech_final flag
-            # #region agent log
-            import json
-            try:
-                with open('/mnt/s/Projects/guitar2discord/.cursor/debug.log', 'a') as f:
-                    f.write(json.dumps({"hypothesisId":"E","location":"deepgram_stt.py:SpeechStarted","message":"SpeechStarted - resetting _speech_final_fired","data":{"current_transcript":self.current_transcript[:50] if self.current_transcript else "","was_speech_final_fired":self._speech_final_fired},"timestamp":int(time.time()*1000)}) + '\n')
-            except: pass
-            # #endregion
             self._speech_final_fired = False
         
         elif msg_type == "Metadata":
