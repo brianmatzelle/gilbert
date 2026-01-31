@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Guitar2Discord</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Guitar2Discord</h1>
+            <p class="subtitle">Stream application audio to Discord</p>
+        </header>
+
+        <main>
+            <!-- Status Indicator -->
+            <div class="status-bar" id="statusBar">
+                <span class="status-dot" id="statusDot"></span>
+                <span class="status-text" id="statusText">Not connected</span>
+            </div>
+
+            <!-- Bot Token Section -->
+            <section class="card">
+                <h2>Discord Bot Token</h2>
+                <div class="input-group">
+                    <input 
+                        type="password" 
+                        id="tokenInput" 
+                        placeholder="Enter your bot token"
+                        autocomplete="off"
+                    >
+                    <button id="toggleToken" class="icon-btn" title="Show/hide token">
+                        👁
+                    </button>
+                </div>
+                <button id="saveToken" class="btn secondary">Save Token</button>
+            </section>
+
+            <!-- Application Selection -->
+            <section class="card">
+                <h2>Audio Source</h2>
+                <div class="select-group">
+                    <select id="processSelect" disabled>
+                        <option value="">Select an application...</option>
+                    </select>
+                    <button id="refreshProcesses" class="icon-btn" title="Refresh list">
+                        🔄
+                    </button>
+                </div>
+            </section>
+
+            <!-- Discord Selection -->
+            <section class="card">
+                <h2>Discord Destination</h2>
+                <div class="select-group">
+                    <select id="serverSelect" disabled>
+                        <option value="">Select a server...</option>
+                    </select>
+                    <button id="refreshServers" class="icon-btn" title="Refresh servers">
+                        🔄
+                    </button>
+                </div>
+                <div class="select-group">
+                    <select id="channelSelect" disabled>
+                        <option value="">Select a voice channel...</option>
+                    </select>
+                </div>
+            </section>
+
+            <!-- Controls -->
+            <section class="controls">
+                <button id="startBtn" class="btn primary large" disabled>
+                    Start Streaming
+                </button>
+                <button id="stopBtn" class="btn danger large" disabled style="display: none;">
+                    Stop Streaming
+                </button>
+            </section>
+
+            <!-- Error Display -->
+            <div id="errorDisplay" class="error-display" style="display: none;">
+                <span class="error-icon">⚠️</span>
+                <span class="error-message" id="errorMessage"></span>
+                <button class="error-close" id="errorClose">×</button>
+            </div>
+        </main>
+
+        <footer>
+            <p>Guitar2Discord v0.1.0 - GPL-3.0</p>
+        </footer>
+    </div>
+
+    <script src="main.js"></script>
+</body>
+</html>

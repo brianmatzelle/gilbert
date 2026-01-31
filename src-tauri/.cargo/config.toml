@@ -1,0 +1,5 @@
+[env]
+# Fix for audiopus_sys build with newer CMake versions
+# The Opus library's CMakeLists.txt uses an old cmake_minimum_required syntax
+# that CMake 4.0+ rejects by default
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"
