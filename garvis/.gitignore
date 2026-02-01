@@ -4,3 +4,7 @@ __pycache__/
 .DS_Store
 dist/
 .venv/
+
+# Local AI dependencies (installed by setup scripts)
+llama.cpp/
+models/

@@ -34,4 +34,8 @@ dependencies = [
     "pydub>=0.25.0",  # Audio format conversion
     "pynacl>=1.5.0",  # Required for Discord voice encryption
     "audioop-lts>=0.2.1; python_version >= '3.13'",  # audioop backport for Python 3.13+
+    # Local AI inference (optional - for USE_LOCAL_* modes)
+    "openai>=1.0.0",  # OpenAI-compatible client for llama.cpp
+    "faster-whisper>=1.0.0",  # Local speech-to-text
+    "piper-tts>=1.2.0",  # Local text-to-speech
 ]

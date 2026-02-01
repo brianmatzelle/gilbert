@@ -1,8 +1,14 @@
 """
 Discord-adapted voice pipeline.
 
-Orchestrates Deepgram STT → Claude → ElevenLabs TTS for Discord voice channels.
-This is similar to the WebSocket pipeline but adapted for Discord's audio format.
+Orchestrates STT → LLM → TTS for Discord voice channels.
+Supports both cloud APIs and local models for low-latency inference.
+
+Cloud (default):
+    Deepgram STT → Claude LLM → ElevenLabs TTS
+
+Local (faster, requires setup-local-models.sh):
+    faster-whisper STT → llama.cpp LLM → Piper TTS
 
 AUDIO FORMAT CONVERSIONS:
 ========================
@@ -10,19 +16,18 @@ AUDIO FORMAT CONVERSIONS:
     Discord Input (from users speaking):
     - 48kHz, stereo, 16-bit PCM
     - Converted to 16kHz mono by audio_sink.py
-    - Sent to Deepgram for transcription
+    - Sent to STT for transcription
 
-    ElevenLabs Output:
-    - MP3 @ 44.1kHz (WebSocket API only supports MP3!)
-    - We accumulate 16KB before converting (avoid partial MP3 frame issues)
-    - pydub converts MP3 → 48kHz stereo PCM
+    TTS Output:
+    - Cloud (ElevenLabs): MP3 @ 44.1kHz → convert to PCM
+    - Local (Piper): WAV @ 22kHz → convert to PCM
 
     Discord Output (Garvis speaking):
     - 48kHz, stereo, 16-bit PCM
     - Played via discord.PCMAudio
 
-WHY BUFFER MP3 BEFORE CONVERTING?
-=================================
+WHY BUFFER AUDIO BEFORE CONVERTING?
+===================================
 MP3 uses frames (~400-1000 bytes each). If we try to decode partial frames,
 pydub/ffmpeg will fail or produce glitchy audio. By buffering 16KB (~10-40 frames),
 we ensure we always have complete frames to decode.
@@ -34,7 +39,7 @@ VOICE ACTIVITY DETECTION & TURN DETECTION:
 ==========================================
 Speech detection is handled by two systems:
 1. Silero VAD - Local, fast VAD for speech start/end (no network latency)
-2. Deepgram endpointing - Server-side VAD that fires speech_final events
+2. STT endpointing - Server/local VAD that fires speech_final events
 
 SEMANTIC TURN DETECTION:
 =======================
@@ -53,16 +58,24 @@ import io
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, Callable, Awaitable
+from typing import Optional, Callable, Awaitable, Union
 
 # Import the Garvis voice components (using as a library!)
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# Cloud providers
 from voice.deepgram_stt import DeepgramSTT
 from voice.claude_llm import ClaudeLLM
 from voice.elevenlabs_tts import ElevenLabsTTS
+
+# Local providers
+from voice.whisper_stt import WhisperSTT
+from voice.local_llm import LocalLLM
+from voice.piper_tts import PiperTTS
+
+# Common components
 from voice.silero_vad import SileroVAD
 from providers import get_providers_by_type, get_provider_by_url, PROVIDERS
 from streaming import get_stream_urls
@@ -73,6 +86,9 @@ from config import (
     AUDIO_THREAD_POOL_SIZE,
     ENABLE_BARGE_IN,
     BARGE_IN_MIN_SPEAK_MS,
+    USE_LOCAL_LLM,
+    USE_LOCAL_STT,
+    USE_LOCAL_TTS,
 )
 
 # Audio conversion - pydub requires ffmpeg
@@ -190,9 +206,9 @@ class DiscordVoicePipeline:
         self.on_status = on_status
         self.on_interrupt = on_interrupt
         
-        self.stt: Optional[DeepgramSTT] = None
-        self.llm: Optional[ClaudeLLM] = None
-        self.tts: Optional[ElevenLabsTTS] = None
+        self.stt: Optional[Union[DeepgramSTT, WhisperSTT]] = None
+        self.llm: Optional[Union[ClaudeLLM, LocalLLM]] = None
+        self.tts: Optional[Union[ElevenLabsTTS, PiperTTS]] = None
         self.vad: Optional[SileroVAD] = None
         
         self.is_listening = False
@@ -202,7 +218,7 @@ class DiscordVoicePipeline:
         
         self._running = False
         self._processing_response = False  # Prevent double-triggering
-        self._pending_transcript = ""  # Latest transcript from Deepgram
+        self._pending_transcript = ""  # Latest transcript from STT
         self._last_vad_trigger_time = 0.0  # When VAD last triggered a response
         self._speaking_start_time = 0.0  # When bot started speaking (for barge-in delay)
         
@@ -214,8 +230,13 @@ class DiscordVoicePipeline:
         self._incomplete_utterance_detected = False
         self._extended_silence_task: Optional[asyncio.Task] = None
         
-        # MP3 buffer for TTS audio conversion
-        self._mp3_buffer = io.BytesIO()
+        # Audio buffer for TTS conversion (MP3 for cloud, WAV for local)
+        self._tts_buffer = io.BytesIO()
+        
+        # Track which providers we're using
+        self._use_local_stt = USE_LOCAL_STT
+        self._use_local_llm = USE_LOCAL_LLM
+        self._use_local_tts = USE_LOCAL_TTS
     
     async def _execute_tool(self, tool_name: str, args: dict) -> str:
         """Execute a tool and return the result string."""
@@ -284,23 +305,43 @@ class DiscordVoicePipeline:
             device_emoji = "🎮" if self.vad.device == "cuda" else "💻"
             print(f"✅ Silero VAD enabled on {vad_device} {device_emoji}")
         else:
-            print("⚠️ Silero VAD not available, using Deepgram VAD only")
+            print("⚠️ Silero VAD not available, using STT VAD only")
         
-        # Wrapper to tag Deepgram's speech_end calls with source
-        async def _deepgram_speech_end(transcript: str):
-            await self._handle_speech_end(transcript, source="deepgram")
+        # Wrapper to tag STT's speech_end calls with source
+        async def _stt_speech_end(transcript: str):
+            await self._handle_speech_end(transcript, source="stt")
         
-        # Initialize components
-        self.stt = DeepgramSTT(
-            on_transcript=self._handle_transcript,
-            on_speech_end=_deepgram_speech_end  # Deepgram's speech_final as backup
-        )
-        self.llm = ClaudeLLM()
+        # Initialize STT (Speech-to-Text)
+        if self._use_local_stt:
+            print("🎤 Using local STT (faster-whisper)")
+            self.stt = WhisperSTT(
+                on_transcript=self._handle_transcript,
+                on_speech_end=_stt_speech_end
+            )
+        else:
+            print("🎤 Using cloud STT (Deepgram)")
+            self.stt = DeepgramSTT(
+                on_transcript=self._handle_transcript,
+                on_speech_end=_stt_speech_end
+            )
         
-        # TTS now uses WebSocket API with direct PCM output - no conversion needed!
-        self.tts = ElevenLabsTTS(on_audio=self._handle_tts_audio)
+        # Initialize LLM
+        if self._use_local_llm:
+            print("🧠 Using local LLM (llama.cpp + Qwen2.5)")
+            self.llm = LocalLLM()
+        else:
+            print("🧠 Using cloud LLM (Claude)")
+            self.llm = ClaudeLLM()
         
-        # Connect to Deepgram
+        # Initialize TTS
+        if self._use_local_tts:
+            print("🔊 Using local TTS (Piper)")
+            self.tts = PiperTTS(on_audio=self._handle_tts_audio)
+        else:
+            print("🔊 Using cloud TTS (ElevenLabs)")
+            self.tts = ElevenLabsTTS(on_audio=self._handle_tts_audio)
+        
+        # Connect to STT
         await self.stt.connect()
         
         print("🎤 Discord voice pipeline started")
@@ -340,9 +381,9 @@ class DiscordVoicePipeline:
         if self.tts:
             await self.tts.stop()
         
-        # Clear MP3 buffer
-        self._mp3_buffer.seek(0)
-        self._mp3_buffer.truncate()
+        # Clear TTS buffer
+        self._tts_buffer.seek(0)
+        self._tts_buffer.truncate()
         
         # Clear any pending transcripts accumulated during bot speech
         self._pending_transcript = ""
@@ -617,8 +658,8 @@ class DiscordVoicePipeline:
             t_tts_start = time.time()
             await self.tts.flush()
             
-            # Flush any remaining MP3 buffer
-            await self._flush_mp3_buffer(flush=True)
+            # Flush any remaining TTS buffer
+            await self._flush_tts_buffer(flush=True)
             
             t_tts_end = time.time()
             
@@ -639,10 +680,9 @@ class DiscordVoicePipeline:
     
     async def _handle_tts_audio(self, audio_bytes: bytes):
         """
-        Handle TTS audio output from ElevenLabs.
+        Handle TTS audio output from ElevenLabs (MP3) or Piper (WAV).
         
-        ElevenLabs WebSocket outputs MP3 audio - we need to convert to PCM for Discord.
-        We accumulate MP3 data to ensure complete frames before decoding.
+        We accumulate audio data and convert to PCM for Discord.
         """
         if not self._running:
             return
@@ -650,52 +690,58 @@ class DiscordVoicePipeline:
         if not audio_bytes:
             return
         
-        # Accumulate MP3 data
-        self._mp3_buffer.write(audio_bytes)
+        # Accumulate audio data
+        self._tts_buffer.write(audio_bytes)
         
-        # Convert and send when we have enough data (avoid partial frame issues)
-        # MP3 frames are ~400-1000 bytes, so 16KB should have many complete frames
-        MIN_MP3_BYTES = 16000
+        # Convert and send when we have enough data
+        # MP3 frames are ~400-1000 bytes, WAV chunks can be any size
+        MIN_BUFFER_BYTES = 16000
         
-        if self._mp3_buffer.tell() >= MIN_MP3_BYTES:
-            await self._flush_mp3_buffer(flush=False)
+        if self._tts_buffer.tell() >= MIN_BUFFER_BYTES:
+            await self._flush_tts_buffer(flush=False)
     
-    async def _flush_mp3_buffer(self, flush: bool = False):
-        """Convert accumulated MP3 to PCM and send to Discord."""
-        if self._mp3_buffer.tell() == 0:
+    async def _flush_tts_buffer(self, flush: bool = False):
+        """Convert accumulated TTS audio to PCM and send to Discord."""
+        if self._tts_buffer.tell() == 0:
             return
         
-        self._mp3_buffer.seek(0)
-        mp3_data = self._mp3_buffer.read()
-        self._mp3_buffer.seek(0)
-        self._mp3_buffer.truncate()
+        self._tts_buffer.seek(0)
+        audio_data = self._tts_buffer.read()
+        self._tts_buffer.seek(0)
+        self._tts_buffer.truncate()
         
-        # Convert MP3 to PCM for Discord (48kHz stereo 16-bit)
+        # Convert audio to PCM for Discord (48kHz stereo 16-bit)
         # Run in thread pool to avoid blocking the event loop
         loop = asyncio.get_running_loop()
         pcm_data = await loop.run_in_executor(
             _get_tts_thread_pool(),
-            self._convert_mp3_to_pcm,
-            mp3_data
+            self._convert_audio_to_pcm,
+            audio_data
         )
         if pcm_data:
             await self.on_audio_output(pcm_data, flush)
     
-    def _convert_mp3_to_pcm(self, mp3_data: bytes) -> Optional[bytes]:
+    def _convert_audio_to_pcm(self, audio_data: bytes) -> Optional[bytes]:
         """
-        Convert MP3 audio to PCM for Discord playback.
+        Convert TTS audio (MP3 or WAV) to PCM for Discord playback.
         Runs in thread pool - do not call from async context directly.
         
         Discord expects: 48000 Hz, 16-bit signed, stereo
         """
-        if not mp3_data or not HAS_PYDUB:
+        if not audio_data or not HAS_PYDUB:
             if not HAS_PYDUB:
                 print("⚠️ pydub not available - cannot convert TTS audio")
             return None
         
         try:
-            # Load MP3
-            audio = AudioSegment.from_mp3(io.BytesIO(mp3_data))
+            # Detect format from header
+            # WAV starts with "RIFF", MP3 with 0xFF 0xFB or ID3
+            if audio_data[:4] == b'RIFF':
+                # WAV format (from Piper)
+                audio = AudioSegment.from_wav(io.BytesIO(audio_data))
+            else:
+                # MP3 format (from ElevenLabs)
+                audio = AudioSegment.from_mp3(io.BytesIO(audio_data))
             
             # Convert to Discord format
             audio = audio.set_channels(2).set_frame_rate(48000).set_sample_width(2)
@@ -703,7 +749,7 @@ class DiscordVoicePipeline:
             return audio.raw_data
         
         except Exception as e:
-            print(f"⚠️ MP3 to PCM conversion failed: {e}")
+            print(f"⚠️ Audio to PCM conversion failed: {e}")
             return None
     
     async def _send_status(self):

@@ -147,3 +147,43 @@ BARGE_IN_MIN_SPEAK_MS = int(os.getenv("BARGE_IN_MIN_SPEAK_MS", "500"))
 TTS_PREBUFFER_MS = int(os.getenv("TTS_PREBUFFER_MS", "250"))
 # Legacy setting (no longer used with WebSocket TTS)
 TTS_BUFFER_THRESHOLD = int(os.getenv("TTS_BUFFER_THRESHOLD", "500"))
+
+# ========== Local Model Configuration ==========
+# Enable local models instead of cloud APIs for faster inference
+# Set these to "true" to use local models (requires setup-local-models.sh)
+
+# Master switches for local vs cloud
+USE_LOCAL_LLM = os.getenv("USE_LOCAL_LLM", "false").lower() == "true"
+USE_LOCAL_STT = os.getenv("USE_LOCAL_STT", "false").lower() == "true"
+USE_LOCAL_TTS = os.getenv("USE_LOCAL_TTS", "false").lower() == "true"
+
+# ========== Local LLM (llama.cpp with Qwen2.5-7B) ==========
+# OpenAI-compatible API endpoint for llama.cpp server
+LOCAL_LLM_URL = os.getenv("LOCAL_LLM_URL", "http://localhost:8080/v1")
+LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "qwen2.5-7b-instruct")
+
+# System prompt for local LLM (same as Claude by default)
+LOCAL_LLM_SYSTEM_PROMPT = os.getenv("LOCAL_LLM_SYSTEM_PROMPT", CLAUDE_SYSTEM_PROMPT)
+
+# ========== Local STT (faster-whisper) ==========
+# Whisper model size: tiny, base, small, medium, large-v3
+# Recommended: "small" for best speed/accuracy balance on RTX 4070
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
+
+# Device: "cuda" for GPU, "cpu" for CPU
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
+
+# Compute type: "float16" for GPU, "int8" for CPU/faster, "float32" for accuracy
+WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "float16")
+
+# ========== Local TTS (Piper) ==========
+# Path to Piper model (.onnx file)
+# Default path assumes setup-local-models.sh was run
+_DEFAULT_PIPER_PATH = str(Path(__file__).parent.parent / "models" / "piper" / "en_US-lessac-medium.onnx")
+PIPER_MODEL_PATH = os.getenv("PIPER_MODEL_PATH", _DEFAULT_PIPER_PATH)
+
+# Piper voice settings
+PIPER_SPEAKER = int(os.getenv("PIPER_SPEAKER", "0"))  # Speaker ID for multi-speaker models
+PIPER_LENGTH_SCALE = float(os.getenv("PIPER_LENGTH_SCALE", "1.0"))  # Speaking speed (lower = faster)
+PIPER_NOISE_SCALE = float(os.getenv("PIPER_NOISE_SCALE", "0.667"))  # Variation in voice
+PIPER_NOISE_W = float(os.getenv("PIPER_NOISE_W", "0.8"))  # Phoneme width variation

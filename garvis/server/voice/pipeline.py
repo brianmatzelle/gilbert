@@ -1,17 +1,32 @@
 """
-Voice pipeline orchestrating Deepgram STT → Claude → Eleven Labs TTS
-With tool calling support for content streaming
+Voice pipeline orchestrating STT → LLM → TTS
+Supports both cloud APIs and local models for low-latency inference.
+
+Cloud (default):
+    Deepgram STT → Claude LLM → ElevenLabs TTS
+
+Local (faster, requires setup-local-models.sh):
+    faster-whisper STT → llama.cpp LLM → Piper TTS
 """
 
 import asyncio
 import json
 import re
-from typing import Optional
+from typing import Optional, Union
 from fastapi import WebSocket
 
+# Cloud providers
 from .deepgram_stt import DeepgramSTT
 from .claude_llm import ClaudeLLM
 from .elevenlabs_tts import ElevenLabsTTS
+
+# Local providers
+from .whisper_stt import WhisperSTT
+from .local_llm import LocalLLM
+from .piper_tts import PiperTTS
+
+# Configuration
+from config import USE_LOCAL_LLM, USE_LOCAL_STT, USE_LOCAL_TTS
 
 # Import tool functions for execution
 from providers import get_providers_by_type, get_provider_by_url, PROVIDERS
@@ -55,9 +70,9 @@ class VoicePipeline:
     
     def __init__(self, websocket: WebSocket):
         self.websocket = websocket
-        self.stt: Optional[DeepgramSTT] = None
-        self.llm: Optional[ClaudeLLM] = None
-        self.tts: Optional[ElevenLabsTTS] = None
+        self.stt: Optional[Union[DeepgramSTT, WhisperSTT]] = None
+        self.llm: Optional[Union[ClaudeLLM, LocalLLM]] = None
+        self.tts: Optional[Union[ElevenLabsTTS, PiperTTS]] = None
         
         self.is_listening = False
         self.is_speaking = False
@@ -65,6 +80,11 @@ class VoicePipeline:
         self.current_transcript = ""
         
         self._running = False
+        
+        # Track which providers we're using
+        self._use_local_stt = USE_LOCAL_STT
+        self._use_local_llm = USE_LOCAL_LLM
+        self._use_local_tts = USE_LOCAL_TTS
     
     async def _execute_tool(self, tool_name: str, args: dict) -> str:
         """Execute a tool and return the result string."""
@@ -158,15 +178,37 @@ class VoicePipeline:
         """Initialize and start the pipeline components"""
         self._running = True
         
-        # Initialize components
-        self.stt = DeepgramSTT(
-            on_transcript=self._handle_transcript,
-            on_speech_end=self._handle_speech_end
-        )
-        self.llm = ClaudeLLM()
-        self.tts = ElevenLabsTTS(on_audio=self._send_audio)
+        # Initialize STT (Speech-to-Text)
+        if self._use_local_stt:
+            print("🎤 Using local STT (faster-whisper)")
+            self.stt = WhisperSTT(
+                on_transcript=self._handle_transcript,
+                on_speech_end=self._handle_speech_end
+            )
+        else:
+            print("🎤 Using cloud STT (Deepgram)")
+            self.stt = DeepgramSTT(
+                on_transcript=self._handle_transcript,
+                on_speech_end=self._handle_speech_end
+            )
         
-        # Connect to Deepgram
+        # Initialize LLM (Language Model)
+        if self._use_local_llm:
+            print("🧠 Using local LLM (llama.cpp + Qwen2.5)")
+            self.llm = LocalLLM()
+        else:
+            print("🧠 Using cloud LLM (Claude)")
+            self.llm = ClaudeLLM()
+        
+        # Initialize TTS (Text-to-Speech)
+        if self._use_local_tts:
+            print("🔊 Using local TTS (Piper)")
+            self.tts = PiperTTS(on_audio=self._send_audio)
+        else:
+            print("🔊 Using cloud TTS (ElevenLabs)")
+            self.tts = ElevenLabsTTS(on_audio=self._send_audio)
+        
+        # Connect STT
         await self.stt.connect()
         
         # Send ready status
