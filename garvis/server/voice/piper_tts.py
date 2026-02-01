@@ -8,19 +8,12 @@ It runs on CPU, leaving GPU memory free for LLM and STT.
 
 import asyncio
 import io
-import json
 import wave
 from pathlib import Path
-from typing import Callable, Awaitable, Optional
+from typing import Callable, Awaitable
 from concurrent.futures import ThreadPoolExecutor
 
-from config import (
-    PIPER_MODEL_PATH,
-    PIPER_SPEAKER,
-    PIPER_LENGTH_SCALE,
-    PIPER_NOISE_SCALE,
-    PIPER_NOISE_W,
-)
+from config import PIPER_MODEL_PATH
 
 
 class PiperTTS:
@@ -90,10 +83,8 @@ class PiperTTS:
         
         self._voice = await loop.run_in_executor(self._executor, load)
         
-        # Load sample rate from config
-        with open(config_path) as f:
-            config = json.load(f)
-            self._sample_rate = config.get("audio", {}).get("sample_rate", 22050)
+        # Get sample rate from voice config
+        self._sample_rate = self._voice.config.sample_rate
         
         print(f"✅ Piper TTS loaded (sample_rate={self._sample_rate})")
     
@@ -134,17 +125,10 @@ class PiperTTS:
         loop = asyncio.get_event_loop()
         
         def synthesize():
-            # Synthesize to raw audio
+            # Synthesize - returns iterator with audio_int16_bytes
             audio_bytes = b''
-            
-            for audio_chunk in self._voice.synthesize_stream_raw(
-                text_to_speak,
-                speaker_id=PIPER_SPEAKER,
-                length_scale=PIPER_LENGTH_SCALE,
-                noise_scale=PIPER_NOISE_SCALE,
-                noise_w=PIPER_NOISE_W
-            ):
-                audio_bytes += audio_chunk
+            for audio_chunk in self._voice.synthesize(text_to_speak):
+                audio_bytes += audio_chunk.audio_int16_bytes
             
             # Wrap in WAV format for the pipeline
             wav_buffer = io.BytesIO()
@@ -217,9 +201,8 @@ class SimplePiperTTS:
         
         self._voice = await loop.run_in_executor(self._executor, load)
         
-        with open(config_path) as f:
-            config = json.load(f)
-            self._sample_rate = config.get("audio", {}).get("sample_rate", 22050)
+        # Get sample rate from voice config
+        self._sample_rate = self._voice.config.sample_rate
     
     async def synthesize(self, text: str) -> bytes:
         """
@@ -233,15 +216,10 @@ class SimplePiperTTS:
         loop = asyncio.get_event_loop()
         
         def synth():
+            # Synthesize - returns iterator with audio_int16_bytes
             audio_bytes = b''
-            for chunk in self._voice.synthesize_stream_raw(
-                text,
-                speaker_id=PIPER_SPEAKER,
-                length_scale=PIPER_LENGTH_SCALE,
-                noise_scale=PIPER_NOISE_SCALE,
-                noise_w=PIPER_NOISE_W
-            ):
-                audio_bytes += chunk
+            for audio_chunk in self._voice.synthesize(text):
+                audio_bytes += audio_chunk.audio_int16_bytes
             
             wav_buffer = io.BytesIO()
             with wave.open(wav_buffer, 'wb') as wav:
