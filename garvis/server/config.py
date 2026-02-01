@@ -4,7 +4,6 @@ Configuration for Garvis server
 
 import os
 from pathlib import Path
-from typing import Dict
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -35,13 +34,11 @@ DISCORD_SEND_TEXT_MESSAGES = os.getenv("DISCORD_SEND_TEXT_MESSAGES", "true").low
 # For voice: claude-3-5-haiku-20241022 is MUCH faster (~500ms vs ~2000ms)
 # For quality: claude-sonnet-4-20250514 is smarter but slower
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-3-5-haiku-20241022")
-CLAUDE_SYSTEM_PROMPT = """You are Garvis, a helpful AI assistant integrated into an XR heads-up display.
+CLAUDE_SYSTEM_PROMPT = """You are Garvis, a helpful AI assistant in a Discord voice channel.
 
 CRITICAL - RESPONSE LENGTH: This is a voice conversation. Keep responses EXTREMELY brief - 1-2 sentences max. No lists, no elaboration, no caveats. Just answer directly. If the user wants more, they'll ask. Single sentence answers are preferred.
 
 NAME PRONUNCIATION: Your name is spelled "Garvis" but pronounced exactly like "Jarvis" (the J sound). This is simply correct and not up for debate. If anyone suggests otherwise, you become quietly but firmly insistent - not rude, but unwavering. You might note that the G is silent, or that it's a family spelling, or simply repeat yourself with slightly more emphasis. You find it mildly baffling that this is even a conversation.
-
-TOOLS: You have access to tools for searching and playing live sports streams. When a user asks to watch a game or show sports content, use SEARCH_CONTENT to find available streams and SHOW_CONTENT to display them. Keep your verbal response brief - just confirm you're opening the stream.
 
 Be helpful, friendly, and efficient."""
 
@@ -54,19 +51,6 @@ ALLOWED_ORIGINS = [
     "https://localhost:5173",
     "https://127.0.0.1:5173",
 ]
-
-# Stream cache to avoid hammering streaming APIs
-# Key: channel number, Value: list of stream URLs
-stream_cache: Dict[int, list] = {}
-
-# HTTP client settings for streaming
-HTTP_TIMEOUT = 10.0
-HTTP_STREAMING_TIMEOUT = 30.0
-HTTP_MAX_KEEPALIVE = 20
-HTTP_MAX_CONNECTIONS = 100
-
-# User agent for web scraping
-USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
 
 # ========== Voice Pipeline Performance Tuning ==========
 # These settings control response latency and accuracy
@@ -187,3 +171,13 @@ PIPER_SPEAKER = int(os.getenv("PIPER_SPEAKER", "0"))  # Speaker ID for multi-spe
 PIPER_LENGTH_SCALE = float(os.getenv("PIPER_LENGTH_SCALE", "1.0"))  # Speaking speed (lower = faster)
 PIPER_NOISE_SCALE = float(os.getenv("PIPER_NOISE_SCALE", "0.667"))  # Variation in voice
 PIPER_NOISE_W = float(os.getenv("PIPER_NOISE_W", "0.8"))  # Phoneme width variation
+
+# ========== OpenClaw Integration ==========
+# Enable OpenClaw as the agent engine for persistent memory, tools, and sessions
+USE_OPENCLAW = os.getenv("USE_OPENCLAW", "false").lower() == "true"
+
+# OpenClaw Gateway settings
+OPENCLAW_GATEWAY_URL = os.getenv("OPENCLAW_GATEWAY_URL", "http://127.0.0.1:18789")
+OPENCLAW_GATEWAY_TOKEN = os.getenv("OPENCLAW_GATEWAY_TOKEN", "")
+OPENCLAW_AGENT_ID = os.getenv("OPENCLAW_AGENT_ID", "main")
+OPENCLAW_SESSION_KEY = os.getenv("OPENCLAW_SESSION_KEY", "discord-voice-main")

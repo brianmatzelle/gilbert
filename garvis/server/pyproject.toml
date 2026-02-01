@@ -1,41 +1,36 @@
 [project]
 name = "garvis-server"
 version = "0.1.0"
-description = "Garvis XR Voice Assistant Server with Vision capabilities"
+description = "Garvis Voice Assistant Server for Discord"
 readme = "README.md"
-requires-python = ">=3.11,<3.14"  # TensorFlow doesn't support 3.14 yet
+requires-python = ">=3.11,<3.14"
 dependencies = [
-    # Core web framework and voice
+    # Core web framework
     "aiohttp>=3.13.2",
-    "anthropic>=0.75.0",
-    "beautifulsoup4>=4.12.0",
-    "deepgram-sdk>=5.3.0",
-    "elevenlabs>=2.27.0",
     "fastapi>=0.127.1",
     "fastmcp>=2.14.1",
     "httpx>=0.28.1",
-    "lxml>=5.0.0",
     "python-dotenv>=1.2.1",
     "uvicorn>=0.40.0",
     "websockets>=15.0.1",
-    # Vision ML dependencies
-    "ultralytics>=8.3.0",  # YOLOv8/v11
-    "torch>=2.0.0",
-    "torchvision>=0.15.0",
-    "torchaudio>=2.0.0",  # Required for Silero VAD
-    "deepface>=0.0.89",  # Face detection (RetinaFace backend)
-    "tf-keras>=2.15.0",  # Required by DeepFace
-    "opencv-python>=4.8.0",
-    "pillow>=10.0.0",
-    "numpy>=1.24.0",
     "pydantic>=2.0.0",
+    # Voice AI services
+    "anthropic>=0.75.0",
+    "deepgram-sdk>=5.3.0",
+    "elevenlabs>=2.27.0",
+    # PyTorch for Silero VAD
+    "torch>=2.0.0",
+    "torchaudio>=2.0.0",
+    # Audio processing
+    "numpy>=1.24.0",
+    "pillow>=10.0.0",
+    "pydub>=0.25.0",
     # Discord voice assistant
-    "py-cord[voice]>=2.6.0",  # Discord API with voice support
-    "pydub>=0.25.0",  # Audio format conversion
-    "pynacl>=1.5.0",  # Required for Discord voice encryption
-    "audioop-lts>=0.2.1; python_version >= '3.13'",  # audioop backport for Python 3.13+
+    "py-cord[voice]>=2.6.0",
+    "pynacl>=1.5.0",
+    "audioop-lts>=0.2.1; python_version >= '3.13'",
     # Local AI inference (optional - for USE_LOCAL_* modes)
-    "openai>=1.0.0",  # OpenAI-compatible client for llama.cpp
-    "faster-whisper>=1.0.0",  # Local speech-to-text
-    "piper-tts>=1.2.0",  # Local text-to-speech
+    "openai>=1.0.0",
+    "faster-whisper>=1.0.0",
+    "piper-tts>=1.2.0",
 ]

@@ -75,10 +75,11 @@ from voice.whisper_stt import WhisperSTT
 from voice.local_llm import LocalLLM
 from voice.piper_tts import PiperTTS
 
+# OpenClaw integration
+from voice.openclaw_llm import OpenClawLLM
+
 # Common components
 from voice.silero_vad import SileroVAD
-from providers import get_providers_by_type, get_provider_by_url, PROVIDERS
-from streaming import get_stream_urls
 from config import (
     INCOMPLETE_UTTERANCE_PATTERNS, 
     INCOMPLETE_UTTERANCE_EXTENDED_SILENCE_MS, 
@@ -89,6 +90,7 @@ from config import (
     USE_LOCAL_LLM,
     USE_LOCAL_STT,
     USE_LOCAL_TTS,
+    USE_OPENCLAW,
 )
 
 # Audio conversion - pydub requires ffmpeg
@@ -207,7 +209,7 @@ class DiscordVoicePipeline:
         self.on_interrupt = on_interrupt
         
         self.stt: Optional[Union[DeepgramSTT, WhisperSTT]] = None
-        self.llm: Optional[Union[ClaudeLLM, LocalLLM]] = None
+        self.llm: Optional[Union[ClaudeLLM, LocalLLM, OpenClawLLM]] = None
         self.tts: Optional[Union[ElevenLabsTTS, PiperTTS]] = None
         self.vad: Optional[SileroVAD] = None
         
@@ -237,50 +239,18 @@ class DiscordVoicePipeline:
         self._use_local_stt = USE_LOCAL_STT
         self._use_local_llm = USE_LOCAL_LLM
         self._use_local_tts = USE_LOCAL_TTS
+        self._use_openclaw = USE_OPENCLAW
     
     async def _execute_tool(self, tool_name: str, args: dict) -> str:
         """Execute a tool and return the result string."""
         print(f"🔧 Executing tool: {tool_name} with args: {args}")
         
         try:
-            if tool_name == "SEARCH_CONTENT":
-                query = args.get("query", "")
-                content_type = args.get("content_type", "sports")
-                
-                providers = get_providers_by_type(content_type)
-                if not providers:
-                    return f"No providers available for content type: {content_type}"
-                
-                all_results = []
-                for provider in providers:
-                    try:
-                        results = await provider.search(query)
-                        all_results.extend(results)
-                    except Exception as e:
-                        print(f"Error searching {provider.name}: {e}")
-                        continue
-                
-                if not all_results:
-                    return "No content found matching your search."
-                
-                result = f"Found {len(all_results)} item(s):\n\n"
-                for i, item in enumerate(all_results[:5], 1):
-                    result += f"{i}. {item['title']} ({item['metadata']})\n"
-                    result += f"   URL: {item['url']}\n"
-                
-                result += "\nTo watch, use SHOW_CONTENT with a content URL."
-                return result
-            
-            elif tool_name == "SHOW_CONTENT":
-                # In Discord context, we can't display video, just acknowledge
-                return "I found the stream. Unfortunately, video playback isn't available in Discord voice - you'd need to use the XR client for that. I can describe what's happening if you'd like!"
-            
-            elif tool_name == "ping":
+            if tool_name == "ping":
                 import json
                 return json.dumps({
                     "status": "pong",
-                    "service": "Garvis Discord Bot",
-                    "providers": [p.name for p in PROVIDERS]
+                    "service": "Garvis Discord Bot"
                 })
             
             else:
@@ -326,7 +296,11 @@ class DiscordVoicePipeline:
             )
         
         # Initialize LLM
-        if self._use_local_llm:
+        # Priority: OpenClaw > Local > Cloud (Claude)
+        if self._use_openclaw:
+            print("🧠 Using OpenClaw agent engine (persistent memory + tools)")
+            self.llm = OpenClawLLM()
+        elif self._use_local_llm:
             print("🧠 Using local LLM (llama.cpp + Qwen2.5)")
             self.llm = LocalLLM()
         else:

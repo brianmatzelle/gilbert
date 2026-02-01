@@ -25,24 +25,21 @@ from .whisper_stt import WhisperSTT
 from .local_llm import LocalLLM
 from .piper_tts import PiperTTS
 
-# Configuration
-from config import USE_LOCAL_LLM, USE_LOCAL_STT, USE_LOCAL_TTS
+# OpenClaw integration
+from .openclaw_llm import OpenClawLLM
 
-# Import tool functions for execution
-from providers import get_providers_by_type, get_provider_by_url, PROVIDERS
-from streaming import get_stream_urls
+# Configuration
+from config import USE_LOCAL_LLM, USE_LOCAL_STT, USE_LOCAL_TTS, USE_OPENCLAW
 
 
 class VoicePipeline:
     """
     Orchestrates the real-time voice conversation flow:
     1. Receives audio from client
-    2. Streams to Deepgram for real-time transcription
-    3. On speech end (VAD), sends transcript to Claude with tools
-    4. Executes any tool calls (SEARCH_CONTENT, SHOW_CONTENT)
-    5. Streams Claude response to Eleven Labs TTS
-    6. Streams TTS audio back to client
-    7. Sends stream URLs to client for video playback
+    2. Streams to STT for real-time transcription
+    3. On speech end (VAD), sends transcript to LLM
+    4. Streams LLM response to TTS
+    5. Streams TTS audio back to client
     """
     
     @staticmethod
@@ -55,23 +52,15 @@ class VoicePipeline:
     
     @staticmethod
     def _normalize_llm_output(text: str) -> str:
-        """Normalize LLM output to fix unwanted phrases and remove markers."""
-        # Remove [DISPLAY_STREAM:...] markers (they shouldn't be spoken)
-        text = re.sub(r'\[DISPLAY_STREAM:[^\]]+\]', '', text)
+        """Normalize LLM output to fix unwanted phrases."""
         # Clean up any extra whitespace
         text = re.sub(r'\s+', ' ', text).strip()
         return text
     
-    @staticmethod
-    def _extract_stream_url(text: str) -> Optional[str]:
-        """Extract stream URL from [DISPLAY_STREAM:url] marker if present."""
-        match = re.search(r'\[DISPLAY_STREAM:([^\]]+)\]', text)
-        return match.group(1) if match else None
-    
     def __init__(self, websocket: WebSocket):
         self.websocket = websocket
         self.stt: Optional[Union[DeepgramSTT, WhisperSTT]] = None
-        self.llm: Optional[Union[ClaudeLLM, LocalLLM]] = None
+        self.llm: Optional[Union[ClaudeLLM, LocalLLM, OpenClawLLM]] = None
         self.tts: Optional[Union[ElevenLabsTTS, PiperTTS]] = None
         
         self.is_listening = False
@@ -85,86 +74,17 @@ class VoicePipeline:
         self._use_local_stt = USE_LOCAL_STT
         self._use_local_llm = USE_LOCAL_LLM
         self._use_local_tts = USE_LOCAL_TTS
+        self._use_openclaw = USE_OPENCLAW
     
     async def _execute_tool(self, tool_name: str, args: dict) -> str:
         """Execute a tool and return the result string."""
         print(f"🔧 Executing tool: {tool_name} with args: {args}")
         
         try:
-            if tool_name == "SEARCH_CONTENT":
-                query = args.get("query", "")
-                content_type = args.get("content_type", "sports")
-                
-                providers = get_providers_by_type(content_type)
-                if not providers:
-                    return f"No providers available for content type: {content_type}"
-                
-                all_results = []
-                for provider in providers:
-                    try:
-                        results = await provider.search(query)
-                        all_results.extend(results)
-                    except Exception as e:
-                        print(f"Error searching {provider.name}: {e}")
-                        continue
-                
-                if not all_results:
-                    return "No content found matching your search. Try different keywords or check if content is currently available."
-                
-                result = f"Found {len(all_results)} item(s):\n\n"
-                for i, item in enumerate(all_results[:5], 1):  # Limit to 5 for voice
-                    result += f"{i}. {item['title']} ({item['metadata']})\n"
-                    result += f"   URL: {item['url']}\n"
-                
-                result += "\nTo watch, use SHOW_CONTENT with a content URL."
-                return result
-            
-            elif tool_name == "SHOW_CONTENT":
-                content_url = args.get("content_url")
-                channel = args.get("channel")
-                source = args.get("source", "auto")
-                cdn = args.get("cdn", 0)
-                # Use relative URL so the XR client's Vite proxy handles it
-                # This avoids mixed-content (HTTPS client -> HTTP server) issues
-                server_url = ""
-                
-                if content_url:
-                    provider = get_provider_by_url(content_url)
-                    if not provider:
-                        return "Error: No provider found for this URL."
-                    
-                    stream_info = await provider.get_stream_info(content_url)
-                    
-                    if stream_info:
-                        if stream_info['source'] == 'watchlive' and source in ["auto", "watchlive"]:
-                            embed_url = stream_info['embed_url']
-                            return f"[DISPLAY_STREAM:{embed_url}]"
-                        
-                        if stream_info['source'] == 'sharkstreams' and source in ["auto", "sharkstreams"]:
-                            channel = int(stream_info['channel'])
-                
-                # Sharkstreams proxy fallback
-                if source in ["auto", "sharkstreams"]:
-                    if not channel:
-                        channel = 548
-                    
-                    try:
-                        urls = await get_stream_urls(channel)
-                        if not urls:
-                            return f"Error: No streams found for channel {channel}."
-                    except Exception as e:
-                        return f"Error: Failed to fetch stream: {str(e)}"
-                    
-                    playlist_url = f"{server_url}/mcp/proxy/playlist.m3u8?channel={channel}&cdn={cdn}"
-                    return f"[DISPLAY_STREAM:{playlist_url}]"
-                
-                return "Error: Unable to load stream."
-            
-            elif tool_name == "ping":
+            if tool_name == "ping":
                 return json.dumps({
                     "status": "pong",
-                    "service": "Garvis Voice Server",
-                    "providers": [p.name for p in PROVIDERS]
+                    "service": "Garvis Voice Server"
                 })
             
             else:
@@ -193,7 +113,11 @@ class VoicePipeline:
             )
         
         # Initialize LLM (Language Model)
-        if self._use_local_llm:
+        # Priority: OpenClaw > Local > Cloud (Claude)
+        if self._use_openclaw:
+            print("🧠 Using OpenClaw agent engine (persistent memory + tools)")
+            self.llm = OpenClawLLM()
+        elif self._use_local_llm:
             print("🧠 Using local LLM (llama.cpp + Qwen2.5)")
             self.llm = LocalLLM()
         else:
@@ -228,7 +152,7 @@ class VoicePipeline:
         if not self._running or not self.stt:
             return
         
-        # Forward audio to Deepgram STT
+        # Forward audio to STT
         await self.stt.send_audio(audio_bytes)
     
     async def handle_control(self, data: dict):
@@ -255,7 +179,7 @@ class VoicePipeline:
             pass
     
     async def _handle_transcript(self, text: str, is_final: bool):
-        """Handle transcript updates from Deepgram"""
+        """Handle transcript updates from STT"""
         text = self._normalize_transcript(text)
         self.current_transcript = text
         
@@ -288,65 +212,35 @@ class VoicePipeline:
             "content": final_transcript
         })
         
-        # Get Claude response with tool support
+        # Get LLM response
         self.is_speaking = True
         await self._send_status()
         
         assistant_response = ""
-        stream_url_sent = False
         
-        # Use tool-calling response flow
-        async for event in self.llm.stream_response_with_tools(
-            self.conversation_history,
-            self._execute_tool
-        ):
-            event_type = event.get("type")
+        # Stream response from LLM
+        async for chunk in self.llm.stream_response(self.conversation_history):
+            assistant_response += chunk
             
-            if event_type == "text":
-                # Accumulate text content
-                assistant_response += event.get("content", "")
-                
-                # Normalize and send to TTS (strip markers)
-                normalized = self._normalize_llm_output(assistant_response)
-                if normalized:
-                    # Send partial transcript to client (for display)
-                    await self.websocket.send_json({
-                        "type": "transcript",
-                        "text": normalized,
-                        "is_final": False,
-                        "role": "assistant"
-                    })
+            # Send partial transcript to client (for display)
+            await self.websocket.send_json({
+                "type": "transcript",
+                "text": assistant_response,
+                "is_final": False,
+                "role": "assistant"
+            })
             
-            elif event_type == "tool_use":
-                # Notify client that a tool is being called
-                print(f"🔧 Tool call: {event.get('name')} with {event.get('input')}")
-            
-            elif event_type == "tool_result":
-                # Check tool result for stream URL
-                result = event.get("result", "")
-                stream_url = self._extract_stream_url(result)
-                if stream_url and not stream_url_sent:
-                    await self._send_stream_url(stream_url)
-                    stream_url_sent = True
-            
-            elif event_type == "stream_url":
-                # Direct stream URL event
-                if not stream_url_sent:
-                    await self._send_stream_url(event.get("url"))
-                    stream_url_sent = True
+            # Stream to TTS
+            await self.tts.add_text(chunk)
         
-        # Finalize response - normalize and remove markers
+        # Finalize response
         final_response = self._normalize_llm_output(assistant_response)
         
-        # Only add to history and TTS if there's actual text content
         if final_response:
             self.conversation_history.append({
                 "role": "assistant",
                 "content": final_response
             })
-            
-            # Send to TTS
-            await self.tts.add_text(final_response)
             
             # Send final transcript
             await self.websocket.send_json({
@@ -361,20 +255,6 @@ class VoicePipeline:
         
         self.is_speaking = False
         await self._send_status()
-    
-    async def _send_stream_url(self, url: str):
-        """Send stream URL to client for video playback"""
-        if not self._running:
-            return
-        
-        try:
-            print(f"📺 Sending stream URL to client: {url}")
-            await self.websocket.send_json({
-                "type": "stream_url",
-                "url": url
-            })
-        except Exception as e:
-            print(f"Error sending stream URL: {e}")
     
     async def _send_audio(self, audio_bytes: bytes):
         """Send TTS audio to the client"""

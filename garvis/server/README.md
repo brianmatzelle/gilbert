@@ -1,8 +1,8 @@
 # Garvis Server
 
-FastAPI + FastMCP server providing real-time voice assistant capabilities for XR applications.
+FastAPI + FastMCP server providing real-time voice assistant capabilities, primarily for Discord voice channels.
 
-## 🏗️ Architecture
+## Architecture
 
 ```
                          ┌─────────────────────────────────┐
@@ -30,7 +30,7 @@ FastAPI + FastMCP server providing real-time voice assistant capabilities for XR
                          └─────────────────────────────────┘
 ```
 
-## 🚀 Quick Start
+## Quick Start
 
 ```bash
 # Install dependencies
@@ -47,7 +47,7 @@ uv run uvicorn main:app --host 0.0.0.0 --port 8000
 uv run uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-## 📡 API Reference
+## API Reference
 
 ### REST Endpoints
 
@@ -56,8 +56,6 @@ uv run uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 | `/health` | GET | Full health check | `{"status": "healthy", ...}` |
 | `/ping` | GET | Simple ping | `{"status": "pong"}` |
 | `/mcp/*` | * | FastMCP tools endpoint | MCP protocol |
-| `/mcp/proxy/playlist.m3u8` | GET | HLS playlist proxy | M3U8 playlist |
-| `/mcp/proxy/chunk` | GET | HLS chunk proxy | Video segment |
 
 ### WebSocket Endpoint
 
@@ -100,9 +98,6 @@ Client                                  Server
 
 // Interrupt TTS playback
 {"type": "interrupt"}
-
-// Update configuration (reserved)
-{"type": "config", "voice_id": "...", "model": "..."}
 ```
 
 #### Server → Client Messages
@@ -134,29 +129,31 @@ Client                                  Server
   "type": "error",
   "message": "Error description"
 }
-
-// Stream URL (video player)
-{
-  "type": "stream_url",
-  "url": "/mcp/proxy/playlist.m3u8?channel=926&cdn=0"
-}
 ```
 
-## ⚙️ Configuration
+## Configuration
 
 ### Environment Variables
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `ANTHROPIC_API_KEY` | ✅ | — | Claude API key |
-| `DEEPGRAM_API_KEY` | ✅ | — | Deepgram API key |
-| `ELEVENLABS_API_KEY` | ✅ | — | Eleven Labs API key |
-| `ELEVENLABS_VOICE_ID` | ❌ | `JBFqnCBsd6RMkjVDRZzb` | Voice ID (George) |
-| `ELEVENLABS_MODEL_ID` | ❌ | `eleven_flash_v2_5` | TTS model (flash is faster) |
-| `ELEVENLABS_OUTPUT_FORMAT` | ❌ | `mp3_44100_128` | Audio format (WebSocket only supports MP3) |
-| `CLAUDE_MODEL` | ❌ | `claude-sonnet-4-20250514` | Claude model |
-| `DISCORD_BOT_TOKEN` | ❌ | — | Discord bot token (for voice bot) |
-| `DISCORD_SEND_TEXT_MESSAGES` | ❌ | `true` | Send responses to text chat |
+| `ANTHROPIC_API_KEY` | Yes | — | Claude API key |
+| `DEEPGRAM_API_KEY` | Yes | — | Deepgram API key |
+| `ELEVENLABS_API_KEY` | Yes | — | Eleven Labs API key |
+| `ELEVENLABS_VOICE_ID` | No | `JBFqnCBsd6RMkjVDRZzb` | Voice ID (George) |
+| `ELEVENLABS_MODEL_ID` | No | `eleven_flash_v2_5` | TTS model (flash is faster) |
+| `ELEVENLABS_OUTPUT_FORMAT` | No | `mp3_44100_128` | Audio format |
+| `CLAUDE_MODEL` | No | `claude-3-5-haiku-20241022` | Claude model |
+| `DISCORD_BOT_TOKEN` | No | — | Discord bot token (for voice bot) |
+| `DISCORD_SEND_TEXT_MESSAGES` | No | `true` | Send responses to text chat |
+| `USE_LOCAL_LLM` | No | `false` | Use local llama.cpp instead of Claude |
+| `USE_LOCAL_STT` | No | `false` | Use local Whisper instead of Deepgram |
+| `USE_LOCAL_TTS` | No | `false` | Use local Piper instead of ElevenLabs |
+| `USE_OPENCLAW` | No | `false` | Use OpenClaw agent engine |
+| `OPENCLAW_GATEWAY_URL` | No | `http://127.0.0.1:18789` | OpenClaw Gateway URL |
+| `OPENCLAW_GATEWAY_TOKEN` | No | — | OpenClaw auth token |
+| `OPENCLAW_AGENT_ID` | No | `main` | OpenClaw agent ID |
+| `OPENCLAW_SESSION_KEY` | No | `discord-voice-main` | Session key for memory |
 
 ### Service Configuration
 
@@ -174,22 +171,20 @@ ALLOWED_ORIGINS = [
 ]
 ```
 
-## 🔌 MCP Tools
+## MCP Tools
 
-The server exposes MCP tools via FastMCP at `/mcp`. Tools are available for Claude to call during conversations.
+The server exposes MCP tools via FastMCP at `/mcp`. Tools are available for the LLM to call during conversations.
 
 ### Built-in Tools
 
 | Tool | Description |
 |------|-------------|
 | `ping` | Health check tool |
-| `SEARCH_CONTENT` | Search for live sports streams by query |
-| `SHOW_CONTENT` | Display a video stream in the XR client |
 
 ### Adding Custom Tools
 
 ```python
-# In main.py
+# In tools/mcp_tools.py
 
 @mcp.tool()
 async def search_web(query: str) -> dict:
@@ -203,20 +198,6 @@ async def search_web(query: str) -> dict:
     """
     # Your implementation
     return {"results": [...]}
-
-@mcp.tool()
-async def control_lights(room: str, brightness: int) -> dict:
-    """Control smart home lights.
-    
-    Args:
-        room: Room name (living_room, bedroom, etc.)
-        brightness: Brightness level 0-100
-        
-    Returns:
-        Confirmation of light state
-    """
-    # Your implementation
-    return {"room": room, "brightness": brightness, "status": "set"}
 ```
 
 ### Tool Best Practices
@@ -226,7 +207,7 @@ async def control_lights(room: str, brightness: int) -> dict:
 3. **Error handling** — Return error info rather than raising exceptions
 4. **Async** — Use `async def` for I/O-bound operations
 
-## 🎙️ Discord Bot
+## Discord Bot
 
 The server includes a Discord voice bot that brings Garvis to Discord voice channels.
 
@@ -269,18 +250,28 @@ Discord Voice Channel
           │
           ▼
 ┌───────────────────┐
-│   Deepgram STT    │ ── Real-time transcription
+│   Silero VAD      │ ── Local voice activity detection
 └─────────┬─────────┘
           │
           ▼
 ┌───────────────────┐
-│   Claude LLM      │ ── Generate response
+│   Deepgram STT    │ ── Real-time transcription
+└─────────┬─────────┘    (or local Whisper)
+          │
+          ▼
+┌───────────────────┐
+│   LLM Provider    │ ── Generate response
+│  ┌─────────────┐  │    Options:
+│  │   Claude    │  │    - Claude (cloud)
+│  │  OpenClaw   │  │    - OpenClaw (persistent memory)
+│  │ Local LLM   │  │    - llama.cpp (local)
+│  └─────────────┘  │
 └─────────┬─────────┘
           │
           ▼
 ┌───────────────────┐
 │  ElevenLabs TTS   │ ── WebSocket streaming (MP3)
-└─────────┬─────────┘
+└─────────┬─────────┘    (or local Piper)
           │
           ▼
 ┌───────────────────┐
@@ -291,7 +282,89 @@ Discord Voice Channel
 Discord Voice Channel (playback)
 ```
 
-## 📁 File Structure
+## OpenClaw Integration
+
+OpenClaw is an agent engine that provides persistent memory, tool calling, and session management. When enabled, it replaces direct Claude API calls with a more capable agent runtime.
+
+### Benefits
+
+| Feature | Without OpenClaw | With OpenClaw |
+|---------|-----------------|---------------|
+| Persistent Memory | None (session only) | JSONL storage, survives restarts |
+| Tool Calling | Only with Anthropic API | Works across all providers |
+| Session Management | Manual | Automatic with compaction |
+| Multi-Agent | No | Yes (route to different agents) |
+| Skills System | No | Yes (ClawHub, custom skills) |
+
+### Setup
+
+1. **Install OpenClaw Gateway**
+
+```bash
+# Requires Node.js >= 22
+npm install -g openclaw@latest
+
+# Run onboarding wizard
+openclaw onboard
+```
+
+2. **Enable HTTP API**
+
+Edit `~/.openclaw/openclaw.json`:
+
+```json
+{
+  "gateway": {
+    "http": {
+      "endpoints": {
+        "chatCompletions": { "enabled": true }
+      }
+    }
+  },
+  "providers": {
+    "anthropic": { "apiKey": "sk-ant-..." }
+  }
+}
+```
+
+3. **Start OpenClaw Gateway**
+
+```bash
+openclaw gateway
+```
+
+4. **Enable in Garvis**
+
+In your `.env` file:
+
+```bash
+USE_OPENCLAW=true
+OPENCLAW_GATEWAY_URL=http://127.0.0.1:18789
+OPENCLAW_GATEWAY_TOKEN=  # Optional, if you configured auth
+OPENCLAW_AGENT_ID=main
+OPENCLAW_SESSION_KEY=discord-voice-main
+```
+
+### Workspace Files
+
+The `garvis/openclaw/` directory contains agent configuration:
+
+- `AGENTS.md` — Agent role, constraints, and behavior
+- `SOUL.md` — Character identity and personality
+
+Copy these to your OpenClaw workspace (`~/.openclaw/`) to customize Garvis's personality.
+
+### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `USE_OPENCLAW` | `false` | Enable OpenClaw as LLM provider |
+| `OPENCLAW_GATEWAY_URL` | `http://127.0.0.1:18789` | Gateway HTTP endpoint |
+| `OPENCLAW_GATEWAY_TOKEN` | — | Bearer token (if configured) |
+| `OPENCLAW_AGENT_ID` | `main` | Agent to route requests to |
+| `OPENCLAW_SESSION_KEY` | `discord-voice-main` | Session key for memory |
+
+## File Structure
 
 ```
 server/
@@ -302,116 +375,33 @@ server/
 │
 ├── api/
 │   ├── __init__.py      # Router exports
-│   ├── health.py        # Health check endpoints
-│   └── proxy.py         # HLS video proxy
+│   └── health.py        # Health check endpoints
 │
 ├── discord_bot/         # Discord voice assistant
 │   ├── __init__.py      # Module exports
 │   ├── bot.py           # Discord bot + commands
 │   ├── audio_sink.py    # Capture voice channel audio
-│   └── voice_pipeline.py # Discord-adapted pipeline (MP3→PCM)
-│
-├── providers/           # Content provider system
-│   ├── __init__.py      # Provider exports
-│   ├── base.py          # Abstract ContentProvider
-│   ├── crackstreams.py  # CrackStreams implementation
-│   └── registry.py      # Provider registry
-│
-├── streaming/
-│   ├── __init__.py      # Streaming exports
-│   └── helpers.py       # Stream URL helpers
+│   └── voice_pipeline.py # Discord-adapted pipeline
 │
 ├── tools/
 │   ├── __init__.py      # Tool exports
-│   └── mcp_tools.py     # SEARCH_CONTENT, SHOW_CONTENT
+│   └── mcp_tools.py     # MCP tool definitions
 │
 └── voice/
-    ├── __init__.py      # Module exports
-    ├── websocket.py     # WebSocket handler (XR client)
-    ├── pipeline.py      # Voice pipeline + stream_url handling
-    ├── deepgram_stt.py  # Speech-to-text
-    ├── claude_llm.py    # Claude LLM with tool calling
-    └── elevenlabs_tts.py # Text-to-speech (WebSocket API)
+    ├── __init__.py       # Module exports
+    ├── websocket.py      # WebSocket handler
+    ├── pipeline.py       # Voice pipeline
+    ├── silero_vad.py     # Local VAD for turn detection
+    ├── deepgram_stt.py   # Speech-to-text (cloud)
+    ├── whisper_stt.py    # Speech-to-text (local)
+    ├── claude_llm.py     # Claude LLM with tool calling
+    ├── local_llm.py      # Local LLM (llama.cpp)
+    ├── openclaw_llm.py   # OpenClaw agent engine
+    ├── elevenlabs_tts.py # Text-to-speech (cloud)
+    └── piper_tts.py      # Text-to-speech (local)
 ```
 
-## 📺 Video Streaming Components
-
-### Content Providers
-
-The provider system allows searching and streaming from multiple content sources.
-
-**Base Interface (`providers/base.py`):**
-```python
-class ContentProvider(ABC):
-    @abstractmethod
-    async def search(self, query: str) -> list[dict]:
-        """Search for content matching query."""
-        pass
-    
-    @abstractmethod
-    async def get_stream_info(self, url: str) -> dict | None:
-        """Extract stream info from a content URL."""
-        pass
-```
-
-**Available Providers:**
-
-| Provider | Source | Content Type |
-|----------|--------|--------------|
-| `CrackStreamsProvider` | crackstreams.ms | Live sports |
-
-### Adding a New Provider
-
-```python
-# providers/my_provider.py
-from .base import ContentProvider
-
-class MyProvider(ContentProvider):
-    name = "my_source"
-    base_url = "https://example.com"
-    
-    async def search(self, query: str) -> list[dict]:
-        # Scrape/API search implementation
-        return [{"title": "...", "url": "...", "time": "..."}]
-    
-    async def get_stream_info(self, url: str) -> dict | None:
-        # Extract HLS/embed URL
-        return {"source": "sharkstreams", "channel": 123}
-
-# Register in providers/registry.py
-PROVIDERS = [MyProvider()]
-```
-
-### HLS Proxy
-
-The `/mcp/proxy/*` endpoints handle CORS and rewrite HLS playlists:
-
-- **`/mcp/proxy/playlist.m3u8`** — Fetches and rewrites M3U8 playlists
-- **`/mcp/proxy/chunk`** — Proxies video segments (.ts files)
-
-This allows the XR client (HTTPS) to stream from HTTP sources without mixed-content errors.
-
-### MCP Tools for Video
-
-**SEARCH_CONTENT:**
-```python
-# Searches all registered providers
-await SEARCH_CONTENT(query="Lakers game")
-# Returns: [{"title": "Lakers vs...", "url": "...", "time": "..."}]
-```
-
-**SHOW_CONTENT:**
-```python
-# Triggers video display in XR client
-await SHOW_CONTENT(content_url="https://crackstreams.ms/...")
-# Returns: "[DISPLAY_STREAM:/mcp/proxy/playlist.m3u8?channel=926&cdn=0]"
-```
-
-The `[DISPLAY_STREAM:url]` marker is parsed by `pipeline.py` and sent as a `stream_url` WebSocket message.
-
----
-
-## 🔧 Voice Pipeline Components
+## Voice Pipeline Components
 
 ### DeepgramSTT
 
@@ -423,20 +413,6 @@ Real-time speech-to-text using Deepgram's streaming API.
 - Utterance end detection
 - Interim results for real-time feedback
 
-**Configuration:**
-```python
-# In deepgram_stt.py
-params = {
-    "model": "nova-2",
-    "language": "en-US",
-    "smart_format": "true",
-    "vad_events": "true",
-    "interim_results": "true",
-    "utterance_end_ms": "1000",
-    "endpointing": "300",
-}
-```
-
 ### ClaudeLLM
 
 Claude integration for conversational responses.
@@ -444,7 +420,19 @@ Claude integration for conversational responses.
 **Features:**
 - Streaming responses for low latency
 - Conversation history management
+- Tool calling support
 - Configurable system prompt
+
+### OpenClawLLM
+
+OpenClaw agent engine integration for enhanced capabilities.
+
+**Features:**
+- Persistent memory across sessions
+- Tool calling across all providers
+- Automatic session management
+- Multi-agent routing support
+- SSE streaming for low latency
 
 ### ElevenLabsTTS
 
@@ -452,38 +440,21 @@ Real-time text-to-speech using ElevenLabs WebSocket API for lowest latency.
 
 **Features:**
 - WebSocket streaming for bidirectional communication
-- Text buffering to meet ElevenLabs' minimum chunk requirements (50+ chars)
-- Audio buffering for smooth playback (prebuffers ~8KB before starting)
-- Flash model (`eleven_flash_v2_5`) for ~75ms inference time
+- Text buffering to meet minimum chunk requirements
+- Audio buffering for smooth playback
+- Flash model for ~75ms inference time
 
-**Architecture:**
-```
-Claude text chunks → Buffer 50+ chars → ElevenLabs WebSocket → MP3 chunks → Buffer 8KB → Convert to PCM → Discord/Client
-```
+### Silero VAD
 
-**Why WebSocket over HTTP?**
-- Lower time-to-first-byte for streaming text input
-- Better handling of partial text from LLM streaming
-- Automatic chunk scheduling with `generation_config`
+Local voice activity detection for accurate turn-taking.
 
-**Configuration:**
-```python
-# Voice settings (in handshake message)
-{
-    "stability": 0.5,
-    "similarity_boost": 0.75,
-    "speed": 1.0
-}
+**Features:**
+- GPU-accelerated inference (CUDA)
+- Configurable speech/silence thresholds
+- Semantic turn detection (incomplete utterance handling)
+- Barge-in support (interrupt bot mid-response)
 
-# Generation config for faster first audio
-{
-    "chunk_length_schedule": [50, 120, 200, 260]
-}
-```
-
-**Note:** WebSocket API only supports MP3 output format. PCM conversion is handled by the voice pipeline.
-
-## 🐛 Debugging
+## Debugging
 
 ### Enable Debug Logging
 
@@ -499,22 +470,16 @@ uv run uvicorn main:app --host 0.0.0.0 --port 8000 --log-level debug
 - Verify API key has Nova-2 access
 
 **Claude responses slow:**
-- Consider using a smaller model
+- Use `claude-3-5-haiku-20241022` for faster responses
 - Tune system prompt for shorter responses
 - Check Anthropic API status
 
-**TTS audio stuttering or choppy:**
-- Use `eleven_flash_v2_5` for lowest latency (~75ms vs ~150ms for turbo)
-- The WebSocket TTS buffers text (50+ chars) and audio (8KB) before sending
+**TTS audio stuttering:**
+- Use `eleven_flash_v2_5` for lowest latency
 - Check network bandwidth and stability
-- MP3 conversion to PCM happens in 16KB chunks to avoid partial frame issues
+- Audio is buffered before playback to smooth jitter
 
-**No audio from ElevenLabs:**
-- WebSocket API only supports MP3 format (not PCM)
-- Check for `output_format_not_allowed` error in logs
-- Ensure `ELEVENLABS_OUTPUT_FORMAT=mp3_44100_128`
-
-## 📊 Performance
+## Performance
 
 ### Latency Targets
 
@@ -528,10 +493,11 @@ uv run uvicorn main:app --host 0.0.0.0 --port 8000 --log-level debug
 ### Optimization Tips
 
 1. **Keep conversations short** — Fewer messages = faster processing
-2. **Tune VAD** — Adjust `utterance_end_ms` for your use case
-3. **Use Turbo TTS** — Fastest Eleven Labs model
+2. **Tune VAD** — Adjust silence thresholds for your use case
+3. **Use Flash TTS** — Fastest Eleven Labs model
 4. **Concise prompts** — System prompt affects response length
+5. **Local models** — Eliminate network latency with local STT/LLM/TTS
 
-## 📜 License
+## License
 
 MIT
