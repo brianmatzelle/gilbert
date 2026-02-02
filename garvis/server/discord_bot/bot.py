@@ -27,9 +27,21 @@ from config import (
     DISCORD_SPEAKER_ATTRIBUTION,
     ASSISTANT_MODE,
     WAKE_WORD,
+    AUTO_JOIN_ENABLED,
+    AUTO_JOIN_DELAY_MS,
+    AUTO_JOIN_MIN_USERS,
+    AUTO_JOIN_CHANNELS_SET,
+    AUTO_JOIN_USERS_SET,
+    AUTO_JOIN_USE_OPENCLAW,
+    USE_OPENCLAW,
+    AUTO_JOIN_SPEAK_FIRST,
+    BOT_API_ENABLED,
+    BOT_API_HOST,
+    BOT_API_PORT,
 )
 from .audio_sink import GarvisAudioSink
 from .voice_pipeline import DiscordVoicePipeline
+from .api_server import BotAPIServer
 
 
 def _log_hardware_config():
@@ -108,6 +120,11 @@ class GarvisDiscordBot(commands.Bot):
         
         # Voice state per guild
         self._voice_states: Dict[int, VoiceState] = {}
+        
+        # API server for external control (OpenClaw cron jobs)
+        self._api_server: Optional[BotAPIServer] = None
+        if BOT_API_ENABLED:
+            self._api_server = BotAPIServer(self, host=BOT_API_HOST, port=BOT_API_PORT)
         
         # Add commands
         self.add_commands()
@@ -398,6 +415,7 @@ class GarvisDiscordBot(commands.Bot):
             on_transcript=lambda text, role, final: self._handle_transcript(ctx, text, role, final),
             on_status=lambda listening, speaking: self._handle_status(ctx, listening, speaking),
             on_interrupt=lambda: self._handle_interrupt(state),  # Barge-in callback
+            on_disconnect_request=lambda: self._handle_disconnect_request(ctx.guild.id, ctx),  # Self-disconnect
             user_lookup=user_lookup,  # For speaker attribution
             barge_in_enabled=state.barge_in_enabled,  # Initial barge-in setting
             assistant_mode=state.assistant_mode,  # Wake word mode
@@ -592,6 +610,16 @@ class GarvisDiscordBot(commands.Bot):
         
         print("🛑 Discord playback stopped (barge-in)")
     
+    async def _handle_disconnect_request(self, guild_id: int, ctx: Optional[commands.Context] = None):
+        """
+        Handle Garvis requesting to disconnect himself.
+        
+        Called when Garvis includes [DISCONNECT] in his response.
+        This allows Garvis to leave when asked by users.
+        """
+        print("🚪 Garvis is disconnecting himself")
+        await self._disconnect_from_voice(guild_id, ctx=None)  # Don't send goodbye message, Garvis already said it
+    
     async def on_ready(self):
         """Called when the bot is ready."""
         print(f"🤖 Garvis Discord Bot is ready!")
@@ -609,43 +637,366 @@ class GarvisDiscordBot(commands.Bot):
         print(f"     !bargein      - Toggle barge-in (interrupt) on/off")
         print(f"     !assistant    - Toggle assistant mode (wake word required)")
         print(f"     !status       - Show current status")
+        
+        # Start API server for OpenClaw cron jobs
+        if self._api_server:
+            await self._api_server.start()
+            print(f"\n   API Endpoints (for OpenClaw cron):")
+            print(f"     GET  /api/status         - Bot status")
+            print(f"     GET  /api/voice-channels - Who's in voice")
+            print(f"     POST /api/join-channel   - Join a channel")
+            print(f"     POST /api/leave-channel  - Leave a channel")
+    
+    async def close(self):
+        """Clean up when bot is shutting down."""
+        # Stop API server
+        if self._api_server:
+            await self._api_server.stop()
+        
+        # Call parent close
+        await super().close()
+    
+    def _use_openclaw_greeting(self) -> bool:
+        """Check if we should use OpenClaw for greetings."""
+        return AUTO_JOIN_SPEAK_FIRST and AUTO_JOIN_USE_OPENCLAW and USE_OPENCLAW
+    
+    async def _do_proactive_greeting(self, state, channel: discord.VoiceChannel):
+        """
+        Let OpenClaw generate a proactive greeting when joining a channel.
+        
+        Used by both event-driven auto-join and API-triggered joins.
+        """
+        if not state.pipeline:
+            return
+        
+        try:
+            from voice.openclaw_llm import OpenClawLLM
+            
+            non_bot_members = [m for m in channel.members if not m.bot]
+            
+            openclaw = OpenClawLLM()
+            wants_to_speak, greeting = await openclaw.get_conversation_starter(
+                user_names=[m.display_name for m in non_bot_members],
+                channel_name=channel.name,
+                guild_name=channel.guild.name,
+                context="Just joined the voice channel"
+            )
+            await openclaw.close()
+            
+            if wants_to_speak and greeting:
+                await asyncio.sleep(0.5)  # Let pipeline fully initialize
+                await state.pipeline.speak_proactively(greeting)
+                
+        except Exception as e:
+            print(f"⚠️ Proactive greeting failed: {e}")
     
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
         """Called when a voice state changes (user joins/leaves/moves channel)."""
-        # Only handle our own voice state changes
-        if member.id != self.user.id:
-            return
-        
         guild_id = member.guild.id
         
-        # Bot was disconnected from voice (moved to None)
-        if before.channel is not None and after.channel is None:
-            print(f"🔌 Bot was disconnected from voice in {member.guild.name}")
+        # Handle bot's own voice state changes
+        if member.id == self.user.id:
+            # Bot was disconnected from voice (moved to None)
+            if before.channel is not None and after.channel is None:
+                print(f"🔌 Bot was disconnected from voice in {member.guild.name}")
+                
+                if guild_id in self._voice_states:
+                    state = self._voice_states[guild_id]
+                    
+                    # Clean up without trying to disconnect (already disconnected)
+                    if state.audio_sink:
+                        await state.audio_sink.stop_processing()
+                        state.audio_sink.cleanup()
+                        state.audio_sink = None
+                    
+                    if state.pipeline:
+                        await state.pipeline.stop()
+                        state.pipeline = None
+                    
+                    if state._playback_task:
+                        state._playback_task.cancel()
+                        state._playback_task = None
+                    
+                    state.voice_client = None
+                    
+                    # Clear the audio buffer
+                    state._audio_buffer.seek(0)
+                    state._audio_buffer.truncate()
+                    
+                    print("🧹 Voice state cleaned up")
+            return
+        
+        # ========== Proactive Voice Channel Joining ==========
+        # Detect when a user (not the bot) joins a voice channel
+        
+        # Skip if auto-join is disabled
+        if not AUTO_JOIN_ENABLED:
+            return
+        
+        # Detect user joining a voice channel (wasn't in one, now is)
+        if before.channel is None and after.channel is not None:
+            await self._handle_user_joined_voice(member, after.channel)
+        
+        # Detect user leaving a voice channel (was in one, now isn't or moved)
+        elif before.channel is not None and (after.channel is None or after.channel != before.channel):
+            await self._handle_user_left_voice(member, before.channel)
+    
+    async def _handle_user_joined_voice(self, member: discord.Member, channel: discord.VoiceChannel):
+        """
+        Handle a user joining a voice channel - potentially auto-join.
+        
+        Uses OpenClaw's memory to make intelligent decisions about whether
+        to join based on learned user preferences.
+        """
+        guild = member.guild
+        guild_id = guild.id
+        
+        # Skip bots
+        if member.bot:
+            return
+        
+        # Check if bot is already in a voice channel in this guild
+        if guild_id in self._voice_states:
+            state = self._voice_states[guild_id]
+            if state.voice_client and state.voice_client.is_connected():
+                # Already in a voice channel, don't auto-join another
+                return
+        
+        # Check channel whitelist (if configured)
+        if AUTO_JOIN_CHANNELS_SET and channel.id not in AUTO_JOIN_CHANNELS_SET:
+            print(f"⏭️ Auto-join skipped: channel {channel.name} not in whitelist")
+            return
+        
+        # Check user whitelist (if configured)
+        if AUTO_JOIN_USERS_SET and member.id not in AUTO_JOIN_USERS_SET:
+            print(f"⏭️ Auto-join skipped: user {member.display_name} not in whitelist")
+            return
+        
+        # Check minimum users requirement (count non-bot members)
+        non_bot_members = [m for m in channel.members if not m.bot]
+        if len(non_bot_members) < AUTO_JOIN_MIN_USERS:
+            return
+        
+        # Get list of other users in the channel (for context)
+        other_users = [m.display_name for m in non_bot_members if m.id != member.id]
+        
+        # Consult OpenClaw if enabled
+        should_join = True
+        join_reason = "Auto-join enabled"
+        
+        if AUTO_JOIN_USE_OPENCLAW and USE_OPENCLAW:
+            try:
+                from voice.openclaw_llm import OpenClawLLM
+                
+                openclaw = OpenClawLLM()
+                should_join, join_reason = await openclaw.should_auto_join_voice(
+                    user_name=member.display_name,
+                    user_id=member.id,
+                    channel_name=channel.name,
+                    channel_id=channel.id,
+                    guild_name=guild.name,
+                    other_users=other_users
+                )
+                await openclaw.close()
+                
+            except Exception as e:
+                print(f"⚠️ OpenClaw consultation failed: {e}")
+                # Fall back to default behavior (join)
+                should_join = True
+                join_reason = f"OpenClaw error, defaulting to join"
+        
+        if not should_join:
+            print(f"⏭️ Auto-join declined for {member.display_name} in {channel.name}: {join_reason}")
+            return
+        
+        # Add delay before joining (prevents rapid joins on channel switching)
+        if AUTO_JOIN_DELAY_MS > 0:
+            await asyncio.sleep(AUTO_JOIN_DELAY_MS / 1000)
             
+            # Re-check that user is still in the channel after delay
+            # (they might have left during the delay)
+            channel = guild.get_channel(channel.id)
+            if channel is None or member not in channel.members:
+                print(f"⏭️ Auto-join cancelled: {member.display_name} left {channel.name if channel else 'channel'}")
+                return
+        
+        # Auto-join the channel!
+        print(f"🎯 Auto-joining {channel.name} in {guild.name} - {member.display_name} is there ({join_reason})")
+        
+        try:
+            # Get or create voice state
+            if guild_id not in self._voice_states:
+                self._voice_states[guild_id] = VoiceState(guild_id)
+            
+            state = self._voice_states[guild_id]
+            
+            # Connect to voice channel
+            state.voice_client = await channel.connect()
+            
+            # Find a text channel to use for responses (prefer general or first available)
+            text_channel = None
+            for tc in guild.text_channels:
+                if tc.permissions_for(guild.me).send_messages:
+                    if 'general' in tc.name.lower():
+                        text_channel = tc
+                        break
+                    if text_channel is None:
+                        text_channel = tc
+            
+            # Note: Auto-join text greeting disabled - Garvis can greet via voice instead
+            # if text_channel:
+            #     await text_channel.send(
+            #         f"👋 Hey! I noticed {member.display_name} joined **{channel.name}**, so I hopped in too. "
+            #         f"Say `!leave` if you'd like me to go, or let me know if you'd prefer I don't auto-join in the future!"
+            #     )
+            
+            # Create a mock context for starting the pipeline
+            # We need this because _start_listening expects a context
+            class MockContext:
+                def __init__(self, guild, channel):
+                    self.guild = guild
+                    self.channel = channel
+                
+                async def send(self, message):
+                    if self.channel:
+                        await self.channel.send(message)
+            
+            mock_ctx = MockContext(guild, text_channel)
+            
+            # Start the voice pipeline
+            await self._start_listening(state, mock_ctx)
+            
+            # Proactive greeting: Let Garvis speak first if he wants to
+            if AUTO_JOIN_SPEAK_FIRST and AUTO_JOIN_USE_OPENCLAW and USE_OPENCLAW and state.pipeline:
+                try:
+                    from voice.openclaw_llm import OpenClawLLM
+                    
+                    openclaw = OpenClawLLM()
+                    wants_to_speak, greeting = await openclaw.get_conversation_starter(
+                        user_names=[m.display_name for m in non_bot_members],
+                        channel_name=channel.name,
+                        guild_name=guild.name,
+                        context=f"Just auto-joined because {member.display_name} entered"
+                    )
+                    await openclaw.close()
+                    
+                    if wants_to_speak and greeting:
+                        # Small delay to let pipeline fully initialize
+                        await asyncio.sleep(0.5)
+                        await state.pipeline.speak_proactively(greeting)
+                        
+                except Exception as e:
+                    print(f"⚠️ Proactive greeting failed: {e}")
+            
+        except Exception as e:
+            print(f"❌ Auto-join failed for {channel.name}: {e}")
+            # Clean up on failure
             if guild_id in self._voice_states:
                 state = self._voice_states[guild_id]
+                if state.voice_client:
+                    try:
+                        await state.voice_client.disconnect()
+                    except:
+                        pass
+                    state.voice_client = None
+    
+    async def _handle_user_left_voice(self, member: discord.Member, channel: discord.VoiceChannel):
+        """
+        Handle a user leaving a voice channel - potentially leave if dynamics changed.
+        
+        Uses OpenClaw's memory to decide whether to stay based on:
+        - Who's still in the channel
+        - Relationship/comfort level with remaining users
+        - Whether the channel is now empty
+        """
+        guild = member.guild
+        guild_id = guild.id
+        
+        # Skip bots leaving
+        if member.bot:
+            return
+        
+        # Check if bot is in this specific channel
+        if guild_id not in self._voice_states:
+            return
+        
+        state = self._voice_states[guild_id]
+        if not state.voice_client or not state.voice_client.is_connected():
+            return
+        
+        # Only care if someone left the channel we're in
+        if state.voice_client.channel.id != channel.id:
+            return
+        
+        # Re-fetch channel to get current members
+        channel = guild.get_channel(channel.id)
+        if channel is None:
+            return
+        
+        # Count non-bot members remaining
+        non_bot_members = [m for m in channel.members if not m.bot]
+        
+        # Always leave if channel is empty (only the bot remains)
+        if len(non_bot_members) == 0:
+            print(f"👋 Channel {channel.name} is now empty, leaving...")
+            
+            # Find a text channel to say goodbye
+            text_channel = self._find_text_channel(guild)
+            if text_channel:
+                await text_channel.send(
+                    f"Looks like everyone left **{channel.name}**, so I'll head out too. "
+                    f"Call me back anytime with `!join`!"
+                )
+            
+            await self._disconnect_from_voice(guild_id)
+            return
+        
+        # Consult OpenClaw about whether to stay given the new dynamics
+        if AUTO_JOIN_USE_OPENCLAW and USE_OPENCLAW:
+            try:
+                from voice.openclaw_llm import OpenClawLLM
                 
-                # Clean up without trying to disconnect (already disconnected)
-                if state.audio_sink:
-                    await state.audio_sink.stop_processing()
-                    state.audio_sink.cleanup()
-                    state.audio_sink = None
+                remaining_users = [m.display_name for m in non_bot_members]
                 
-                if state.pipeline:
-                    await state.pipeline.stop()
-                    state.pipeline = None
+                openclaw = OpenClawLLM()
+                should_stay, reason = await openclaw.should_stay_in_voice(
+                    departed_user_name=member.display_name,
+                    departed_user_id=member.id,
+                    remaining_users=remaining_users,
+                    channel_name=channel.name,
+                    guild_name=guild.name
+                )
+                await openclaw.close()
                 
-                if state._playback_task:
-                    state._playback_task.cancel()
-                    state._playback_task = None
-                
-                state.voice_client = None
-                
-                # Clear the audio buffer
-                state._audio_buffer.seek(0)
-                state._audio_buffer.truncate()
-                
-                print("🧹 Voice state cleaned up")
+                if not should_stay:
+                    print(f"👋 Garvis decided to leave {channel.name}: {reason}")
+                    
+                    text_channel = self._find_text_channel(guild)
+                    if text_channel:
+                        # Let Garvis craft a natural exit message
+                        await text_channel.send(
+                            f"Alright, I think I'll head out for now. {reason} "
+                            f"Feel free to call me back with `!join` if you need me!"
+                        )
+                    
+                    await self._disconnect_from_voice(guild_id)
+                else:
+                    print(f"🎤 Garvis decided to stay in {channel.name}: {reason}")
+                    
+            except Exception as e:
+                print(f"⚠️ OpenClaw stay-check failed: {e}")
+                # On error, stay by default (don't rudely leave)
+    
+    def _find_text_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
+        """Find a suitable text channel for messages (prefer 'general')."""
+        text_channel = None
+        for tc in guild.text_channels:
+            if tc.permissions_for(guild.me).send_messages:
+                if 'general' in tc.name.lower():
+                    return tc
+                if text_channel is None:
+                    text_channel = tc
+        return text_channel
 
 
 def run_bot():

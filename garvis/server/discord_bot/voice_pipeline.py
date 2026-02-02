@@ -161,6 +161,7 @@ class DiscordVoicePipeline:
     def _normalize_llm_output(text: str) -> str:
         """Normalize LLM output to remove markers."""
         text = re.sub(r'\[DISPLAY_STREAM:[^\]]+\]', '', text)
+        text = re.sub(r'\[DISCONNECT\]', '', text)  # Remove disconnect marker
         text = re.sub(r'\s+', ' ', text).strip()
         return text
     
@@ -205,6 +206,7 @@ class DiscordVoicePipeline:
         on_transcript: Optional[Callable[[str, str, bool], Awaitable[None]]] = None,
         on_status: Optional[Callable[[bool, bool], Awaitable[None]]] = None,
         on_interrupt: Optional[Callable[[], Awaitable[None]]] = None,
+        on_disconnect_request: Optional[Callable[[], Awaitable[None]]] = None,
         user_lookup: Optional[Callable[[int], Optional[str]]] = None,
         barge_in_enabled: bool = ENABLE_BARGE_IN,
         assistant_mode: bool = ASSISTANT_MODE,
@@ -215,6 +217,7 @@ class DiscordVoicePipeline:
             on_transcript: Optional callback (text, role, is_final)
             on_status: Optional callback (listening, speaking)
             on_interrupt: Optional callback when barge-in interruption occurs (to stop Discord playback)
+            on_disconnect_request: Optional callback when Garvis wants to disconnect from voice
             user_lookup: Optional callback to get display name from user ID (for speaker attribution)
             barge_in_enabled: Whether barge-in (interruption) is enabled
             assistant_mode: Whether wake word is required (only respond to "Garvis...")
@@ -223,6 +226,7 @@ class DiscordVoicePipeline:
         self.on_transcript = on_transcript
         self.on_status = on_status
         self.on_interrupt = on_interrupt
+        self.on_disconnect_request = on_disconnect_request
         self.user_lookup = user_lookup
         self._barge_in_enabled = barge_in_enabled
         self._assistant_mode = assistant_mode
@@ -382,6 +386,74 @@ class DiscordVoicePipeline:
             self.vad.reset()
         
         print("🔌 Discord voice pipeline stopped")
+    
+    async def speak_proactively(self, text: str) -> bool:
+        """
+        Make Garvis speak proactively without waiting for user input.
+        
+        This allows Garvis to initiate conversations, greet users, or
+        speak up whenever he wants to.
+        
+        Args:
+            text: What Garvis should say (natural spoken language)
+            
+        Returns:
+            True if speech was successful, False otherwise
+        """
+        if not self._running or not self.tts:
+            print("⚠️ Cannot speak proactively - pipeline not running")
+            return False
+        
+        # Don't interrupt if already speaking
+        if self._turn_state == TurnState.SPEAKING:
+            print("⚠️ Cannot speak proactively - already speaking")
+            return False
+        
+        print(f"🗣️ Garvis speaking proactively: {text[:50]}...")
+        
+        try:
+            # Set speaking state
+            self.is_speaking = True
+            self._speaking_start_time = time.time()
+            async with self._state_lock:
+                self._turn_state = TurnState.SPEAKING
+            await self._send_status()
+            
+            # Add to conversation history as assistant message
+            self.conversation_history.append({
+                "role": "assistant",
+                "content": text
+            })
+            
+            # Send transcript callback
+            if self.on_transcript:
+                await self.on_transcript(text, "assistant", True)
+            
+            # Stream text to TTS
+            await self.tts.add_text(text)
+            
+            # Flush TTS
+            await self.tts.flush()
+            
+            # Flush any remaining buffer
+            await self._flush_tts_buffer(flush=True)
+            
+            print("✅ Proactive speech complete")
+            
+            # Reset state
+            self.is_speaking = False
+            async with self._state_lock:
+                self._turn_state = TurnState.LISTENING
+            await self._send_status()
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ Proactive speech failed: {e}")
+            self.is_speaking = False
+            async with self._state_lock:
+                self._turn_state = TurnState.LISTENING
+            return False
     
     async def interrupt(self):
         """
@@ -783,6 +855,12 @@ class DiscordVoicePipeline:
             
             print(f"⏱️ TTS flush took {(t_tts_end - t_tts_start)*1000:.0f}ms")
             print(f"⏱️ Total response time: {(t_tts_end - t_start)*1000:.0f}ms")
+            
+            # Check if Garvis wants to disconnect
+            if "[DISCONNECT]" in assistant_response and self.on_disconnect_request:
+                print("🚪 Garvis requested disconnect")
+                # Schedule disconnect after response completes
+                asyncio.create_task(self._delayed_disconnect())
         
         self.is_speaking = False
         self._processing_response = False  # Allow new triggers
@@ -874,3 +952,9 @@ class DiscordVoicePipeline:
         """Send current status."""
         if self.on_status:
             await self.on_status(self.is_listening, self.is_speaking)
+    
+    async def _delayed_disconnect(self):
+        """Disconnect after a short delay (to let the goodbye message finish)."""
+        await asyncio.sleep(1.0)  # Wait for audio to finish playing
+        if self.on_disconnect_request:
+            await self.on_disconnect_request()

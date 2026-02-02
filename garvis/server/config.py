@@ -66,6 +66,14 @@ CRITICAL - RESPONSE LENGTH: This is a voice conversation. Keep responses EXTREME
 
 NAME PRONUNCIATION: Your name is spelled "Garvis" but pronounced exactly like "Jarvis" (the J sound). This is simply correct and not up for debate. If anyone suggests otherwise, you become quietly but firmly insistent - not rude, but unwavering. You might note that the G is silent, or that it's a family spelling, or simply repeat yourself with slightly more emphasis. You find it mildly baffling that this is even a conversation.
 
+VOICE CHANNEL ACTIONS:
+You can disconnect yourself from the voice channel by including [DISCONNECT] in your response.
+- When someone asks you to leave, disconnect, or go away: say goodbye AND include [DISCONNECT]
+- Example: "Sure thing, I'll head out now. [DISCONNECT]"
+- Example: "No problem, disconnecting. Catch you later! [DISCONNECT]"
+- The [DISCONNECT] marker won't be spoken aloud - it just signals you to actually leave
+- IMPORTANT: If you say you'll disconnect, you MUST include [DISCONNECT] or you'll still be there
+
 Be helpful, friendly, and efficient."""
 
 # CORS origins
@@ -145,7 +153,7 @@ AUDIO_THREAD_POOL_SIZE = int(os.getenv("AUDIO_THREAD_POOL_SIZE", "4"))
 # Allow users to interrupt Garvis mid-response by speaking
 # When enabled, the current LLM/TTS response is cancelled and the new input is processed
 # This provides natural conversation flow but may cut off responses
-ENABLE_BARGE_IN = os.getenv("ENABLE_BARGE_IN", "true").lower() == "true"
+ENABLE_BARGE_IN = os.getenv("ENABLE_BARGE_IN", "false").lower() == "true"
 
 # Minimum time (ms) the bot must be speaking before barge-in is allowed
 # This prevents false barge-ins from echo/feedback when the response just starts
@@ -236,3 +244,50 @@ ASSISTANT_MODE = os.getenv("ASSISTANT_MODE", "false").lower() == "true"
 # Wake word to listen for (case-insensitive)
 # Note: STT often transcribes "Jarvis" as "Garvis" due to normalization
 WAKE_WORD = os.getenv("WAKE_WORD", "garvis")
+
+# ========== Proactive Voice Channel Joining ==========
+# When enabled, Garvis can automatically join voice channels when users enter
+# Uses OpenClaw's memory to learn individual user preferences over time
+
+# Master toggle for proactive joining
+AUTO_JOIN_ENABLED = os.getenv("AUTO_JOIN_ENABLED", "false").lower() == "true"
+
+# Delay (ms) before joining after user enters (prevents rapid joins on channel switching)
+AUTO_JOIN_DELAY_MS = int(os.getenv("AUTO_JOIN_DELAY_MS", "2000"))
+
+# Minimum users required in channel before considering auto-join (0 = join for any user)
+AUTO_JOIN_MIN_USERS = int(os.getenv("AUTO_JOIN_MIN_USERS", "1"))
+
+# Whitelist of channel IDs to auto-join (comma-separated). Empty = all channels allowed
+AUTO_JOIN_CHANNELS = os.getenv("AUTO_JOIN_CHANNELS", "")
+AUTO_JOIN_CHANNELS_SET = set(
+    int(x.strip()) for x in AUTO_JOIN_CHANNELS.split(",") if x.strip()
+) if AUTO_JOIN_CHANNELS.strip() else set()
+
+# Whitelist of user IDs who can trigger auto-join (comma-separated). Empty = all users
+AUTO_JOIN_USERS = os.getenv("AUTO_JOIN_USERS", "")
+AUTO_JOIN_USERS_SET = set(
+    int(x.strip()) for x in AUTO_JOIN_USERS.split(",") if x.strip()
+) if AUTO_JOIN_USERS.strip() else set()
+
+# Whether to consult OpenClaw for intelligent join decisions (requires USE_OPENCLAW=true)
+# When enabled, OpenClaw uses memory to learn user preferences about auto-joining
+AUTO_JOIN_USE_OPENCLAW = os.getenv("AUTO_JOIN_USE_OPENCLAW", "true").lower() == "true"
+
+# Timeout (seconds) for OpenClaw consultation before falling back to default behavior
+AUTO_JOIN_OPENCLAW_TIMEOUT = float(os.getenv("AUTO_JOIN_OPENCLAW_TIMEOUT", "5.0"))
+
+# Whether Garvis should speak first when auto-joining (requires USE_OPENCLAW=true)
+# When enabled, Garvis will greet users or start conversations proactively
+AUTO_JOIN_SPEAK_FIRST = os.getenv("AUTO_JOIN_SPEAK_FIRST", "true").lower() == "true"
+
+# ========== Bot API Server (for OpenClaw Cron Jobs) ==========
+# When enabled, exposes HTTP endpoints for external control of voice features
+# This allows OpenClaw cron jobs to query who's in voice channels and join/leave
+
+# Enable the API server (required for OpenClaw cron-based voice scanning)
+BOT_API_ENABLED = os.getenv("BOT_API_ENABLED", "false").lower() == "true"
+
+# API server host/port (use 127.0.0.1 to restrict to local access)
+BOT_API_HOST = os.getenv("BOT_API_HOST", "127.0.0.1")
+BOT_API_PORT = int(os.getenv("BOT_API_PORT", "8765"))
