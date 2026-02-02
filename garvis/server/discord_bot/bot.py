@@ -98,6 +98,7 @@ class GarvisDiscordBot(commands.Bot):
         intents.message_content = True
         intents.voice_states = True
         intents.guilds = True
+        intents.members = True  # Required for speaker attribution (get_member lookup)
         
         super().__init__(
             command_prefix="!",
