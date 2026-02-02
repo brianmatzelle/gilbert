@@ -24,12 +24,13 @@ from .elevenlabs_tts import ElevenLabsTTS
 from .whisper_stt import WhisperSTT
 from .local_llm import LocalLLM
 from .piper_tts import PiperTTS
+from .kokoro_tts import KokoroTTS
 
 # OpenClaw integration
 from .openclaw_llm import OpenClawLLM
 
 # Configuration
-from config import USE_LOCAL_LLM, USE_LOCAL_STT, USE_LOCAL_TTS, USE_OPENCLAW
+from config import USE_LOCAL_LLM, USE_LOCAL_STT, USE_LOCAL_TTS, USE_OPENCLAW, USE_KOKORO_TTS
 
 
 class VoicePipeline:
@@ -61,7 +62,7 @@ class VoicePipeline:
         self.websocket = websocket
         self.stt: Optional[Union[DeepgramSTT, WhisperSTT]] = None
         self.llm: Optional[Union[ClaudeLLM, LocalLLM, OpenClawLLM]] = None
-        self.tts: Optional[Union[ElevenLabsTTS, PiperTTS]] = None
+        self.tts: Optional[Union[ElevenLabsTTS, PiperTTS, KokoroTTS]] = None
         
         self.is_listening = False
         self.is_speaking = False
@@ -75,6 +76,7 @@ class VoicePipeline:
         self._use_local_llm = USE_LOCAL_LLM
         self._use_local_tts = USE_LOCAL_TTS
         self._use_openclaw = USE_OPENCLAW
+        self._use_kokoro_tts = USE_KOKORO_TTS
     
     async def _execute_tool(self, tool_name: str, args: dict) -> str:
         """Execute a tool and return the result string."""
@@ -125,9 +127,14 @@ class VoicePipeline:
             self.llm = ClaudeLLM()
         
         # Initialize TTS (Text-to-Speech)
+        # Priority: Cloud (ElevenLabs) > Local Kokoro > Local Piper
         if self._use_local_tts:
-            print("🔊 Using local TTS (Piper)")
-            self.tts = PiperTTS(on_audio=self._send_audio)
+            if self._use_kokoro_tts:
+                print("🔊 Using local TTS (Kokoro - realistic voice)")
+                self.tts = KokoroTTS(on_audio=self._send_audio)
+            else:
+                print("🔊 Using local TTS (Piper)")
+                self.tts = PiperTTS(on_audio=self._send_audio)
         else:
             print("🔊 Using cloud TTS (ElevenLabs)")
             self.tts = ElevenLabsTTS(on_audio=self._send_audio)

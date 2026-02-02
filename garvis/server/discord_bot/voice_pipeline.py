@@ -74,6 +74,7 @@ from voice.elevenlabs_tts import ElevenLabsTTS
 from voice.whisper_stt import WhisperSTT
 from voice.local_llm import LocalLLM
 from voice.piper_tts import PiperTTS
+from voice.kokoro_tts import KokoroTTS
 
 # OpenClaw integration
 from voice.openclaw_llm import OpenClawLLM
@@ -91,6 +92,8 @@ from config import (
     USE_LOCAL_STT,
     USE_LOCAL_TTS,
     USE_OPENCLAW,
+    USE_KOKORO_TTS,
+    DISCORD_SPEAKER_ATTRIBUTION,
 )
 
 # Audio conversion - pydub requires ffmpeg
@@ -132,6 +135,11 @@ class DiscordVoicePipeline:
     4. On speech_final from Deepgram, send transcript to Claude
     5. Stream Claude response to Eleven Labs TTS (WebSocket API)
     6. TTS outputs PCM directly (48kHz stereo) - no conversion needed!
+    
+    Speaker Attribution:
+    - Tracks which user is currently speaking based on audio source
+    - Includes speaker name in messages to LLM ("Brian: Hello Garvis")
+    - Enables personalized responses and per-user memory with OpenClaw
     
     Turn Detection Strategy:
     - Uses Silero VAD (local) + Deepgram endpointing (server) as dual triggers
@@ -195,6 +203,7 @@ class DiscordVoicePipeline:
         on_transcript: Optional[Callable[[str, str, bool], Awaitable[None]]] = None,
         on_status: Optional[Callable[[bool, bool], Awaitable[None]]] = None,
         on_interrupt: Optional[Callable[[], Awaitable[None]]] = None,
+        user_lookup: Optional[Callable[[int], Optional[str]]] = None,
     ):
         """
         Args:
@@ -202,15 +211,17 @@ class DiscordVoicePipeline:
             on_transcript: Optional callback (text, role, is_final)
             on_status: Optional callback (listening, speaking)
             on_interrupt: Optional callback when barge-in interruption occurs (to stop Discord playback)
+            user_lookup: Optional callback to get display name from user ID (for speaker attribution)
         """
         self.on_audio_output = on_audio_output
         self.on_transcript = on_transcript
         self.on_status = on_status
         self.on_interrupt = on_interrupt
+        self.user_lookup = user_lookup
         
         self.stt: Optional[Union[DeepgramSTT, WhisperSTT]] = None
         self.llm: Optional[Union[ClaudeLLM, LocalLLM, OpenClawLLM]] = None
-        self.tts: Optional[Union[ElevenLabsTTS, PiperTTS]] = None
+        self.tts: Optional[Union[ElevenLabsTTS, PiperTTS, KokoroTTS]] = None
         self.vad: Optional[SileroVAD] = None
         
         self.is_listening = False
@@ -223,6 +234,11 @@ class DiscordVoicePipeline:
         self._pending_transcript = ""  # Latest transcript from STT
         self._last_vad_trigger_time = 0.0  # When VAD last triggered a response
         self._speaking_start_time = 0.0  # When bot started speaking (for barge-in delay)
+        
+        # Speaker attribution
+        self._current_speaker_id: Optional[int] = None  # User ID of current speaker
+        self._current_speaker_name: Optional[str] = None  # Display name of current speaker
+        self._use_speaker_attribution = DISCORD_SPEAKER_ATTRIBUTION
         
         # Turn state machine
         self._turn_state = TurnState.LISTENING
@@ -240,6 +256,7 @@ class DiscordVoicePipeline:
         self._use_local_llm = USE_LOCAL_LLM
         self._use_local_tts = USE_LOCAL_TTS
         self._use_openclaw = USE_OPENCLAW
+        self._use_kokoro_tts = USE_KOKORO_TTS
     
     async def _execute_tool(self, tool_name: str, args: dict) -> str:
         """Execute a tool and return the result string."""
@@ -308,9 +325,14 @@ class DiscordVoicePipeline:
             self.llm = ClaudeLLM()
         
         # Initialize TTS
+        # Priority: Cloud (ElevenLabs) > Local Kokoro > Local Piper
         if self._use_local_tts:
-            print("🔊 Using local TTS (Piper)")
-            self.tts = PiperTTS(on_audio=self._handle_tts_audio)
+            if self._use_kokoro_tts:
+                print("🔊 Using local TTS (Kokoro - realistic voice)")
+                self.tts = KokoroTTS(on_audio=self._handle_tts_audio)
+            else:
+                print("🔊 Using local TTS (Piper)")
+                self.tts = PiperTTS(on_audio=self._handle_tts_audio)
         else:
             print("🔊 Using cloud TTS (ElevenLabs)")
             self.tts = ElevenLabsTTS(on_audio=self._handle_tts_audio)
@@ -378,15 +400,25 @@ class DiscordVoicePipeline:
         if self.on_interrupt:
             await self.on_interrupt()
     
-    async def process_audio(self, audio_bytes: bytes):
+    async def process_audio(self, audio_bytes: bytes, user_id: Optional[int] = None):
         """
         Process incoming audio from Discord user.
         
         Args:
             audio_bytes: 16kHz mono PCM audio
+            user_id: Optional user ID of the speaker (for attribution)
         """
         if not self._running or not self.stt:
             return
+        
+        # Track current speaker for attribution
+        if user_id is not None and user_id != self._current_speaker_id:
+            self._current_speaker_id = user_id
+            # Look up display name if we have a lookup function
+            if self.user_lookup:
+                self._current_speaker_name = self.user_lookup(user_id)
+            else:
+                self._current_speaker_name = None
         
         # Process through local VAD for speaking state (non-blocking)
         if self.vad and self.vad.is_available:
@@ -582,13 +614,20 @@ class DiscordVoicePipeline:
         if self.vad:
             self.vad.reset()
         
+        # Format message with speaker attribution if enabled
+        if self._use_speaker_attribution and self._current_speaker_name:
+            # Include speaker name in the message so LLM knows who said it
+            message_content = f"{self._current_speaker_name}: {final_transcript}"
+            print(f"👤 {self._current_speaker_name}: {final_transcript}")
+        else:
+            message_content = final_transcript
+            print(f"👤 User: {final_transcript}")
+        
         # Add user message to history
         self.conversation_history.append({
             "role": "user",
-            "content": final_transcript
+            "content": message_content
         })
-        
-        print(f"👤 User: {final_transcript}")
         
         # Get Claude response
         self.is_speaking = True

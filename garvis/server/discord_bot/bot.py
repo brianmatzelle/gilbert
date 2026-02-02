@@ -17,7 +17,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import discord
 from discord.ext import commands
 
-from config import DISCORD_BOT_TOKEN, DISCORD_SEND_TEXT_MESSAGES, USE_CUDA, AUDIO_THREAD_POOL_SIZE, ENABLE_BARGE_IN
+from config import (
+    DISCORD_BOT_TOKEN,
+    DISCORD_SEND_TEXT_MESSAGES,
+    USE_CUDA,
+    AUDIO_THREAD_POOL_SIZE,
+    ENABLE_BARGE_IN,
+    DISCORD_MUTED_USERS_SET,
+    DISCORD_SPEAKER_ATTRIBUTION,
+)
 from .audio_sink import GarvisAudioSink
 from .voice_pipeline import DiscordVoicePipeline
 
@@ -64,6 +72,7 @@ class VoiceState:
         self.pipeline: Optional[DiscordVoicePipeline] = None
         self.audio_sink: Optional[GarvisAudioSink] = None
         self.target_user_id: Optional[int] = None  # Who we're listening to
+        self.muted_user_ids: set = set(DISCORD_MUTED_USERS_SET)  # Users/bots to ignore
         self._audio_buffer = io.BytesIO()  # Accumulate audio for smooth playback
         self._playback_task: Optional[asyncio.Task] = None
         self._playback_lock = asyncio.Lock()  # Prevent concurrent playback issues
@@ -131,19 +140,12 @@ class GarvisDiscordBot(commands.Bot):
         @self.command(name="leave", help="Leave the voice channel")
         async def leave(ctx: commands.Context):
             """Leave the voice channel."""
-            guild_id = ctx.guild.id
-            
-            if guild_id in self._voice_states:
-                state = self._voice_states[guild_id]
-                await self._stop_listening(state)
-                
-                if state.voice_client:
-                    await state.voice_client.disconnect()
-                    state.voice_client = None
-                
-                await ctx.send("👋 Left the voice channel. See you later!")
-            else:
-                await ctx.send("❌ I'm not in a voice channel!")
+            await self._disconnect_from_voice(ctx.guild.id, ctx)
+        
+        @self.command(name="disconnect", help="Safely disconnect from voice channel")
+        async def disconnect(ctx: commands.Context):
+            """Safely disconnect from the voice channel (alias for !leave)."""
+            await self._disconnect_from_voice(ctx.guild.id, ctx)
         
         @self.command(name="listen", help="Set who to listen to: !listen @user or !listen all")
         async def listen(ctx: commands.Context, target: str = "all"):
@@ -169,6 +171,69 @@ class GarvisDiscordBot(commands.Bot):
                     state.audio_sink.target_user_id = user.id
             else:
                 await ctx.send("❌ Please mention a user or say `all`. Example: `!listen @User` or `!listen all`")
+        
+        @self.command(name="mute", help="Mute a user/bot: !mute @user")
+        async def mute(ctx: commands.Context, target: str = None):
+            """Mute a user or bot so Garvis ignores their audio."""
+            guild_id = ctx.guild.id
+            
+            if guild_id not in self._voice_states:
+                await ctx.send("❌ I'm not in a voice channel! Use `!join` first.")
+                return
+            
+            state = self._voice_states[guild_id]
+            
+            if not ctx.message.mentions:
+                # List currently muted users
+                if state.muted_user_ids:
+                    muted_names = []
+                    for uid in state.muted_user_ids:
+                        if isinstance(uid, int):
+                            member = ctx.guild.get_member(uid)
+                            muted_names.append(member.display_name if member else f"ID:{uid}")
+                        else:
+                            muted_names.append(str(uid))
+                    await ctx.send(f"🔇 Currently muted: **{', '.join(muted_names)}**\n\nUse `!mute @user` to mute or `!unmute @user` to unmute.")
+                else:
+                    await ctx.send("🔊 No users are currently muted.\n\nUse `!mute @user` to mute a user or bot.")
+                return
+            
+            user = ctx.message.mentions[0]
+            state.muted_user_ids.add(user.id)
+            
+            # Update the audio sink if it exists
+            if state.audio_sink:
+                state.audio_sink.add_muted_user(user.id)
+            
+            await ctx.send(f"🔇 Muted **{user.display_name}**. I'll ignore their audio.")
+        
+        @self.command(name="unmute", help="Unmute a user/bot: !unmute @user")
+        async def unmute(ctx: commands.Context):
+            """Unmute a user or bot."""
+            guild_id = ctx.guild.id
+            
+            if guild_id not in self._voice_states:
+                await ctx.send("❌ I'm not in a voice channel! Use `!join` first.")
+                return
+            
+            state = self._voice_states[guild_id]
+            
+            if not ctx.message.mentions:
+                await ctx.send("❌ Please mention a user to unmute. Example: `!unmute @User`")
+                return
+            
+            user = ctx.message.mentions[0]
+            
+            if user.id in state.muted_user_ids:
+                state.muted_user_ids.discard(user.id)
+                
+                # Update the audio sink if it exists
+                if state.audio_sink:
+                    state.audio_sink.remove_muted_user(user.id)
+                
+                await ctx.send(f"🔊 Unmuted **{user.display_name}**. I'll listen to them again.")
+            else:
+                await ctx.send(f"ℹ️ **{user.display_name}** is not muted.")
         
         @self.command(name="status", help="Show current status")
         async def status(ctx: commands.Context):
@@ -211,30 +276,68 @@ class GarvisDiscordBot(commands.Bot):
             else:
                 status_parts.append("👥 Listening to: **Everyone**")
             
+            # Show muted users
+            if state.muted_user_ids:
+                muted_names = []
+                for uid in state.muted_user_ids:
+                    if isinstance(uid, int):
+                        member = ctx.guild.get_member(uid)
+                        muted_names.append(member.display_name if member else f"ID:{uid}")
+                    else:
+                        muted_names.append(str(uid))
+                status_parts.append(f"🔇 Muted: **{', '.join(muted_names)}**")
+            
+            # Speaker attribution status
+            attr_status = "Enabled" if DISCORD_SPEAKER_ATTRIBUTION else "Disabled"
+            status_parts.append(f"🏷️ Speaker attribution: **{attr_status}**")
+            
             await ctx.send("\n".join(status_parts))
     
     async def _start_listening(self, state: VoiceState, ctx: commands.Context):
         """Start the voice pipeline and audio capture."""
         
-        # Create the voice pipeline with barge-in support
+        # Clean up any existing pipeline/sink first (in case of reconnect)
+        if state.audio_sink:
+            await state.audio_sink.stop_processing()
+            state.audio_sink.cleanup()
+            state.audio_sink = None
+        
+        if state.pipeline:
+            await state.pipeline.stop()
+            state.pipeline = None
+        
+        # Clear the audio buffer
+        state._audio_buffer.seek(0)
+        state._audio_buffer.truncate()
+        
+        # Create user lookup function for speaker attribution
+        def user_lookup(user_id: int) -> Optional[str]:
+            """Get display name from user ID."""
+            member = ctx.guild.get_member(user_id)
+            return member.display_name if member else None
+        
+        # Create the voice pipeline with barge-in support and speaker attribution
         state.pipeline = DiscordVoicePipeline(
             on_audio_output=lambda audio, flush: self._play_audio(state, audio, flush),
             on_transcript=lambda text, role, final: self._handle_transcript(ctx, text, role, final),
             on_status=lambda listening, speaking: self._handle_status(ctx, listening, speaking),
             on_interrupt=lambda: self._handle_interrupt(state),  # Barge-in callback
+            user_lookup=user_lookup,  # For speaker attribution
         )
         
         # Start the pipeline
         await state.pipeline.start()
         
-        # Create audio sink to capture user voice
+        # Create audio sink to capture user voice (now with user_id passed to pipeline)
         async def on_audio(pcm_bytes: bytes, user_id: int):
             if state.pipeline:
-                await state.pipeline.process_audio(pcm_bytes)
+                await state.pipeline.process_audio(pcm_bytes, user_id)
         
         state.audio_sink = GarvisAudioSink(
             on_audio=on_audio,
             target_user_id=state.target_user_id,
+            muted_user_ids=state.muted_user_ids,
+            user_lookup=user_lookup,
             event_loop=asyncio.get_running_loop()
         )
         
@@ -247,7 +350,19 @@ class GarvisDiscordBot(commands.Bot):
             )
             await state.audio_sink.start_processing()
         
-        print(f"🎤 Started listening in {ctx.guild.name}")
+        # Log muted users if any
+        if state.muted_user_ids:
+            muted_names = []
+            for uid in state.muted_user_ids:
+                if isinstance(uid, int):
+                    member = ctx.guild.get_member(uid)
+                    muted_names.append(member.display_name if member else f"ID:{uid}")
+                else:
+                    muted_names.append(str(uid))
+            print(f"🔇 Muted users: {', '.join(muted_names)}")
+        
+        speaker_mode = "enabled" if DISCORD_SPEAKER_ATTRIBUTION else "disabled"
+        print(f"🎤 Started listening in {ctx.guild.name} (speaker attribution: {speaker_mode})")
     
     async def _stop_listening(self, state: VoiceState):
         """Stop the voice pipeline and audio capture."""
@@ -270,9 +385,47 @@ class GarvisDiscordBot(commands.Bot):
         
         print("🔌 Stopped listening")
     
-    def _on_recording_finished(self, sink, channel):
-        """Callback when recording finishes."""
+    async def _disconnect_from_voice(self, guild_id: int, ctx: Optional[commands.Context] = None):
+        """Safely disconnect from voice channel and clean up all resources."""
+        if guild_id in self._voice_states:
+            state = self._voice_states[guild_id]
+            
+            # Stop listening first (this stops recording)
+            await self._stop_listening(state)
+            
+            # Disconnect from voice
+            if state.voice_client:
+                if state.voice_client.is_connected():
+                    await state.voice_client.disconnect()
+                state.voice_client = None
+            
+            # Clear the audio buffer
+            state._audio_buffer.seek(0)
+            state._audio_buffer.truncate()
+            
+            if ctx:
+                await ctx.send("👋 Left the voice channel. See you later!")
+        else:
+            if ctx:
+                await ctx.send("❌ I'm not in a voice channel!")
+    
+    async def _on_recording_finished(self, sink, channel):
+        """Callback when recording finishes (async required by py-cord)."""
         print(f"📹 Recording finished in {channel.name}")
+        
+        # Clean up the voice state when recording finishes
+        # This happens when the bot is disconnected from voice
+        guild_id = channel.guild.id
+        if guild_id in self._voice_states:
+            state = self._voice_states[guild_id]
+            # Stop processing but don't disconnect (already disconnected)
+            if state.audio_sink:
+                await state.audio_sink.stop_processing()
+                state.audio_sink.cleanup()
+                state.audio_sink = None
+            if state.pipeline:
+                await state.pipeline.stop()
+                state.pipeline = None
     
     async def _play_audio(self, state: VoiceState, pcm_data: bytes, flush: bool = False):
         """
@@ -367,11 +520,52 @@ class GarvisDiscordBot(commands.Bot):
         print(f"   Logged in as: {self.user.name} ({self.user.id})")
         print(f"   Servers: {len(self.guilds)}")
         print(f"\n   Commands:")
-        print(f"     !join   - Join your voice channel")
-        print(f"     !leave  - Leave the voice channel")
+        print(f"     !join         - Join your voice channel")
+        print(f"     !leave        - Leave the voice channel")
+        print(f"     !disconnect   - Safely disconnect (alias for !leave)")
         print(f"     !listen @user - Only listen to a specific user")
         print(f"     !listen all   - Listen to everyone")
-        print(f"     !status - Show current status")
+        print(f"     !mute @user   - Mute a user/bot (ignore their audio)")
+        print(f"     !unmute @user - Unmute a user/bot")
+        print(f"     !mute         - List currently muted users")
+        print(f"     !status       - Show current status")
+    
+    async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+        """Called when a voice state changes (user joins/leaves/moves channel)."""
+        # Only handle our own voice state changes
+        if member.id != self.user.id:
+            return
+        
+        guild_id = member.guild.id
+        
+        # Bot was disconnected from voice (moved to None)
+        if before.channel is not None and after.channel is None:
+            print(f"🔌 Bot was disconnected from voice in {member.guild.name}")
+            
+            if guild_id in self._voice_states:
+                state = self._voice_states[guild_id]
+                
+                # Clean up without trying to disconnect (already disconnected)
+                if state.audio_sink:
+                    await state.audio_sink.stop_processing()
+                    state.audio_sink.cleanup()
+                    state.audio_sink = None
+                
+                if state.pipeline:
+                    await state.pipeline.stop()
+                    state.pipeline = None
+                
+                if state._playback_task:
+                    state._playback_task.cancel()
+                    state._playback_task = None
+                
+                state.voice_client = None
+                
+                # Clear the audio buffer
+                state._audio_buffer.seek(0)
+                state._audio_buffer.truncate()
+                
+                print("🧹 Voice state cleaned up")
 
 
 def run_bot():

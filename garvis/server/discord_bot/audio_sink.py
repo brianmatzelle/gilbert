@@ -25,7 +25,7 @@ from discord.sinks import Sink
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from config import AUDIO_PROCESS_INTERVAL, AUDIO_THREAD_POOL_SIZE
+from config import AUDIO_PROCESS_INTERVAL, AUDIO_THREAD_POOL_SIZE, DISCORD_MUTED_USERS_SET
 
 # Audio conversion - need pydub for format conversion
 # Note: pydub also requires ffmpeg to be installed on the system
@@ -57,6 +57,11 @@ class GarvisAudioSink(Sink):
     Converts Discord's 48kHz stereo PCM to 16kHz mono PCM for Deepgram.
     Accumulates audio from speaking users and fires callbacks for the voice pipeline.
     
+    Features:
+    - Per-user audio separation
+    - Mute list filtering (ignore specific users/bots)
+    - User ID tracking for speaker attribution
+    
     Threading: Audio conversion runs in a thread pool to avoid blocking the event loop.
     
     Note: Speaking detection is handled by Silero VAD in the voice pipeline,
@@ -67,17 +72,23 @@ class GarvisAudioSink(Sink):
         self,
         on_audio: Callable[[bytes, int], Awaitable[None]],
         target_user_id: Optional[int] = None,
+        muted_user_ids: Optional[set] = None,
+        user_lookup: Optional[Callable[[int], Optional[str]]] = None,
         event_loop: Optional[asyncio.AbstractEventLoop] = None,
     ):
         """
         Args:
             on_audio: Async callback (pcm_bytes, user_id) for 16kHz mono PCM
             target_user_id: If set, only process audio from this user
+            muted_user_ids: Set of user IDs to ignore (muted users/bots)
+            user_lookup: Function to get display name from user ID
             event_loop: The asyncio event loop to use for callbacks
         """
         super().__init__()
         self.on_audio = on_audio
         self.target_user_id = target_user_id
+        self.muted_user_ids: set = muted_user_ids or set()
+        self.user_lookup = user_lookup
         self._loop = event_loop
         
         # Audio buffer per user (accumulate before resampling)
@@ -102,8 +113,24 @@ class GarvisAudioSink(Sink):
         if self.target_user_id and user_id != self.target_user_id:
             return
         
+        # Check mute list (by user ID)
+        if user_id in self.muted_user_ids:
+            return
+        
         # Store audio in buffer
         self._buffers[user_id].write(data)
+    
+    def add_muted_user(self, user_id: int):
+        """Add a user to the mute list."""
+        self.muted_user_ids.add(user_id)
+    
+    def remove_muted_user(self, user_id: int):
+        """Remove a user from the mute list."""
+        self.muted_user_ids.discard(user_id)
+    
+    def is_muted(self, user_id: int) -> bool:
+        """Check if a user is muted."""
+        return user_id in self.muted_user_ids
     
     async def start_processing(self):
         """Start the background audio processing loop."""

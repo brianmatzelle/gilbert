@@ -18,6 +18,7 @@ New-Item -ItemType Directory -Force -Path $ModelsDir | Out-Null
 New-Item -ItemType Directory -Force -Path "$ModelsDir\llm" | Out-Null
 New-Item -ItemType Directory -Force -Path "$ModelsDir\whisper" | Out-Null
 New-Item -ItemType Directory -Force -Path "$ModelsDir\piper" | Out-Null
+New-Item -ItemType Directory -Force -Path "$ModelsDir\kokoro" | Out-Null
 
 # Check for CUDA
 Write-Host "Checking CUDA availability..."
@@ -134,11 +135,42 @@ if ((Test-Path $VoiceOnnx) -and (Test-Path $VoiceJson)) {
 }
 
 # ==========================================
-# 5. CREATE START SCRIPT
+# 5. SETUP KOKORO TTS (Realistic Voice)
 # ==========================================
 Write-Host ""
 Write-Host "==========================================" -ForegroundColor Cyan
-Write-Host "  5. Creating llama.cpp server script" -ForegroundColor Cyan
+Write-Host "  5. Setting up Kokoro TTS (Realistic Voice)" -ForegroundColor Cyan
+Write-Host "==========================================" -ForegroundColor Cyan
+
+$KokoroModelDir = Join-Path $ModelsDir "kokoro"
+$KokoroModel = Join-Path $KokoroModelDir "kokoro-v1.0.onnx"
+$KokoroVoices = Join-Path $KokoroModelDir "voices-v1.0.bin"
+
+if ((Test-Path $KokoroModel) -and (Test-Path $KokoroVoices)) {
+    Write-Host "Kokoro TTS model already downloaded" -ForegroundColor Green
+} else {
+    Write-Host "Downloading Kokoro TTS model (~300MB)..."
+    
+    $KokoroBase = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0"
+    
+    Invoke-WebRequest -Uri "$KokoroBase/kokoro-v1.0.onnx" -OutFile $KokoroModel -UseBasicParsing
+    Invoke-WebRequest -Uri "$KokoroBase/voices-v1.0.bin" -OutFile $KokoroVoices -UseBasicParsing
+    
+    Write-Host "Kokoro TTS downloaded" -ForegroundColor Green
+}
+
+Write-Host ""
+Write-Host "Kokoro voices available (see: https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md):"
+Write-Host "  Female (A-grade): af_heart, af_bella"
+Write-Host "  Female (good):    af_nicole, af_sarah, af_sky"
+Write-Host "  Male (good):      am_michael, am_fenrir, am_puck"
+
+# ==========================================
+# 6. CREATE START SCRIPT
+# ==========================================
+Write-Host ""
+Write-Host "==========================================" -ForegroundColor Cyan
+Write-Host "  6. Creating llama.cpp server script" -ForegroundColor Cyan
 Write-Host "==========================================" -ForegroundColor Cyan
 
 $RunLlamaScript = @'
@@ -194,7 +226,7 @@ Write-Host ""
 Write-Host "VRAM Usage Estimate:"
 Write-Host "  - Qwen2.5-7B Q4_K_M: ~4.5GB"
 Write-Host "  - faster-whisper small: ~1GB"
-Write-Host "  - Piper TTS: CPU only"
+Write-Host "  - Piper/Kokoro TTS: CPU only (ONNX)"
 Write-Host "  - Total: ~5.5GB / 12GB"
 Write-Host ""
 Write-Host "Next steps:"
@@ -208,4 +240,13 @@ Write-Host "  USE_LOCAL_STT=true"
 Write-Host "  USE_LOCAL_TTS=true"
 Write-Host "  LOCAL_LLM_URL=http://localhost:8080/v1"
 Write-Host "  WHISPER_MODEL=small"
+Write-Host ""
+Write-Host "For Piper TTS (robotic but fast):"
+Write-Host "  USE_KOKORO_TTS=false"
 Write-Host "  PIPER_MODEL_PATH=$ModelsDir\piper\en_US-lessac-medium.onnx"
+Write-Host ""
+Write-Host "For Kokoro TTS (realistic voice - recommended):"
+Write-Host "  USE_KOKORO_TTS=true"
+Write-Host "  KOKORO_MODEL_PATH=$ModelsDir\kokoro\kokoro-v1.0.onnx"
+Write-Host "  KOKORO_VOICES_PATH=$ModelsDir\kokoro\voices-v1.0.bin"
+Write-Host "  KOKORO_VOICE=af_heart  # or af_bella, am_michael, etc."

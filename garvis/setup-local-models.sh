@@ -18,6 +18,7 @@ mkdir -p "$MODELS_DIR"
 mkdir -p "$MODELS_DIR/llm"
 mkdir -p "$MODELS_DIR/whisper"
 mkdir -p "$MODELS_DIR/piper"
+mkdir -p "$MODELS_DIR/kokoro"
 
 # Check for CUDA
 echo "Checking CUDA availability..."
@@ -130,11 +131,42 @@ else
 fi
 
 # ==========================================
-# 5. CREATE START SCRIPT
+# 5. SETUP KOKORO TTS (Realistic Voice)
 # ==========================================
 echo ""
 echo "=========================================="
-echo "  5. Creating llama.cpp server script"
+echo "  5. Setting up Kokoro TTS (Realistic Voice)"
+echo "=========================================="
+
+KOKORO_MODEL_DIR="$MODELS_DIR/kokoro"
+KOKORO_MODEL="$KOKORO_MODEL_DIR/kokoro-v1.0.onnx"
+KOKORO_VOICES="$KOKORO_MODEL_DIR/voices-v1.0.bin"
+
+if [ -f "$KOKORO_MODEL" ] && [ -f "$KOKORO_VOICES" ]; then
+    echo "✅ Kokoro TTS model already downloaded"
+else
+    echo "Downloading Kokoro TTS model (~300MB)..."
+    
+    KOKORO_BASE="https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0"
+    
+    wget -O "$KOKORO_MODEL" "$KOKORO_BASE/kokoro-v1.0.onnx"
+    wget -O "$KOKORO_VOICES" "$KOKORO_BASE/voices-v1.0.bin"
+    
+    echo "✅ Kokoro TTS downloaded"
+fi
+
+echo ""
+echo "Kokoro voices available (see: https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md):"
+echo "  Female (A-grade): af_heart, af_bella"
+echo "  Female (good):    af_nicole, af_sarah, af_sky"
+echo "  Male (good):      am_michael, am_fenrir, am_puck"
+
+# ==========================================
+# 6. CREATE START SCRIPT
+# ==========================================
+echo ""
+echo "=========================================="
+echo "  6. Creating llama.cpp server script"
 echo "=========================================="
 
 cat > "$SCRIPT_DIR/run-llama-server.sh" << 'EOF'
@@ -191,7 +223,7 @@ echo ""
 echo "VRAM Usage Estimate:"
 echo "  - Qwen2.5-7B Q4_K_M: ~4.5GB"
 echo "  - faster-whisper small: ~1GB"
-echo "  - Piper TTS: CPU only"
+echo "  - Piper/Kokoro TTS: CPU only (ONNX)"
 echo "  - Total: ~5.5GB / 12GB"
 echo ""
 echo "Next steps:"
@@ -205,4 +237,13 @@ echo "  USE_LOCAL_STT=true"
 echo "  USE_LOCAL_TTS=true"
 echo "  LOCAL_LLM_URL=http://localhost:8080/v1"
 echo "  WHISPER_MODEL=small"
+echo ""
+echo "For Piper TTS (robotic but fast):"
+echo "  USE_KOKORO_TTS=false"
 echo "  PIPER_MODEL_PATH=$MODELS_DIR/piper/en_US-lessac-medium.onnx"
+echo ""
+echo "For Kokoro TTS (realistic voice - recommended):"
+echo "  USE_KOKORO_TTS=true"
+echo "  KOKORO_MODEL_PATH=$MODELS_DIR/kokoro/kokoro-v1.0.onnx"
+echo "  KOKORO_VOICES_PATH=$MODELS_DIR/kokoro/voices-v1.0.bin"
+echo "  KOKORO_VOICE=af_heart  # or af_bella, am_michael, etc."

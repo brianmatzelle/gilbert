@@ -30,6 +30,32 @@ DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 # Set to "false" to stop Garvis from sending his responses to text chat
 DISCORD_SEND_TEXT_MESSAGES = os.getenv("DISCORD_SEND_TEXT_MESSAGES", "true").lower() == "true"
 
+# ========== Discord Audio Filtering ==========
+# Mute specific users/bots so Garvis doesn't listen to them
+# Comma-separated list of Discord usernames or user IDs
+# Example: "Jockie Music,Rythm,123456789012345678"
+DISCORD_MUTED_USERS = os.getenv("DISCORD_MUTED_USERS", "")
+
+# Parse muted users into a set (handles both names and IDs)
+def _parse_muted_users(muted_str: str) -> set:
+    """Parse muted users string into a set of names/IDs."""
+    if not muted_str.strip():
+        return set()
+    items = [item.strip() for item in muted_str.split(",") if item.strip()]
+    result = set()
+    for item in items:
+        # Try to parse as int (user ID), otherwise keep as string (name)
+        try:
+            result.add(int(item))
+        except ValueError:
+            result.add(item.lower())  # Store names lowercase for case-insensitive matching
+    return result
+
+DISCORD_MUTED_USERS_SET = _parse_muted_users(DISCORD_MUTED_USERS)
+
+# Enable speaker attribution in transcripts (tells Garvis who said what)
+DISCORD_SPEAKER_ATTRIBUTION = os.getenv("DISCORD_SPEAKER_ATTRIBUTION", "true").lower() == "true"
+
 # Claude Configuration
 # For voice: claude-3-5-haiku-20241022 is MUCH faster (~500ms vs ~2000ms)
 # For quality: claude-sonnet-4-20250514 is smarter but slower
@@ -171,6 +197,26 @@ PIPER_SPEAKER = int(os.getenv("PIPER_SPEAKER", "0"))  # Speaker ID for multi-spe
 PIPER_LENGTH_SCALE = float(os.getenv("PIPER_LENGTH_SCALE", "1.0"))  # Speaking speed (lower = faster)
 PIPER_NOISE_SCALE = float(os.getenv("PIPER_NOISE_SCALE", "0.667"))  # Variation in voice
 PIPER_NOISE_W = float(os.getenv("PIPER_NOISE_W", "0.8"))  # Phoneme width variation
+
+# ========== Local TTS (Kokoro) ==========
+# Kokoro is a more realistic-sounding TTS alternative to Piper
+# Set USE_KOKORO_TTS=true to use Kokoro instead of Piper for local TTS
+USE_KOKORO_TTS = os.getenv("USE_KOKORO_TTS", "false").lower() == "true"
+
+# Path to Kokoro model files
+_DEFAULT_KOKORO_MODEL_PATH = str(Path(__file__).parent.parent / "models" / "kokoro" / "kokoro-v1.0.onnx")
+_DEFAULT_KOKORO_VOICES_PATH = str(Path(__file__).parent.parent / "models" / "kokoro" / "voices-v1.0.bin")
+KOKORO_MODEL_PATH = os.getenv("KOKORO_MODEL_PATH", _DEFAULT_KOKORO_MODEL_PATH)
+KOKORO_VOICES_PATH = os.getenv("KOKORO_VOICES_PATH", _DEFAULT_KOKORO_VOICES_PATH)
+
+# Kokoro voice settings
+# Available voices (American English):
+#   Female: af_heart (A), af_bella (A-), af_nicole (B-), af_sarah (C+), af_sky (C-)
+#   Male: am_michael (C+), am_fenrir (C+), am_puck (C+), am_adam (F+)
+# See https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md for all voices
+KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_heart")  # af_heart is highest quality
+KOKORO_SPEED = float(os.getenv("KOKORO_SPEED", "1.0"))  # Speaking speed (1.0 = normal)
+KOKORO_LANG = os.getenv("KOKORO_LANG", "en-us")  # Language code (en-us, en-gb, etc.)
 
 # ========== OpenClaw Integration ==========
 # Enable OpenClaw as the agent engine for persistent memory, tools, and sessions
