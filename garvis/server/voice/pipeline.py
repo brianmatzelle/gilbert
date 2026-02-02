@@ -136,11 +136,15 @@ class VoicePipeline:
                 print("🔊 Using local TTS (Piper)")
                 self.tts = PiperTTS(on_audio=self._send_audio)
         else:
-            print("🔊 Using cloud TTS (ElevenLabs)")
+            print("🔊 Using cloud TTS (ElevenLabs - persistent connection)")
             self.tts = ElevenLabsTTS(on_audio=self._send_audio)
         
         # Connect STT
         await self.stt.connect()
+        
+        # Connect TTS (ElevenLabs uses persistent WebSocket)
+        if isinstance(self.tts, ElevenLabsTTS):
+            await self.tts.connect()
         
         # Send ready status
         await self._send_status()
@@ -153,6 +157,9 @@ class VoicePipeline:
             await self.stt.disconnect()
         if self.tts:
             await self.tts.stop()
+            # Disconnect persistent TTS connections (ElevenLabs)
+            if hasattr(self.tts, 'disconnect'):
+                await self.tts.disconnect()
     
     async def process_audio(self, audio_bytes: bytes):
         """Process incoming audio from the client"""

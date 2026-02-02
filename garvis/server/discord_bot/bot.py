@@ -25,6 +25,8 @@ from config import (
     ENABLE_BARGE_IN,
     DISCORD_MUTED_USERS_SET,
     DISCORD_SPEAKER_ATTRIBUTION,
+    ASSISTANT_MODE,
+    WAKE_WORD,
 )
 from .audio_sink import GarvisAudioSink
 from .voice_pipeline import DiscordVoicePipeline
@@ -73,6 +75,8 @@ class VoiceState:
         self.audio_sink: Optional[GarvisAudioSink] = None
         self.target_user_id: Optional[int] = None  # Who we're listening to
         self.muted_user_ids: set = set(DISCORD_MUTED_USERS_SET)  # Users/bots to ignore
+        self.barge_in_enabled: bool = ENABLE_BARGE_IN  # Allow interrupting responses
+        self.assistant_mode: bool = ASSISTANT_MODE  # Only respond to wake word
         self._audio_buffer = io.BytesIO()  # Accumulate audio for smooth playback
         self._playback_task: Optional[asyncio.Task] = None
         self._playback_lock = asyncio.Lock()  # Prevent concurrent playback issues
@@ -235,6 +239,67 @@ class GarvisDiscordBot(commands.Bot):
             else:
                 await ctx.send(f"ℹ️ **{user.display_name}** is not muted.")
         
+        @self.command(name="bargein", help="Toggle barge-in (interrupt) feature")
+        async def bargein(ctx: commands.Context, setting: str = None):
+            """Toggle or set the barge-in (interrupt) feature."""
+            guild_id = ctx.guild.id
+            
+            if guild_id not in self._voice_states:
+                await ctx.send("❌ I'm not in a voice channel! Use `!join` first.")
+                return
+            
+            state = self._voice_states[guild_id]
+            
+            if setting is None:
+                # Toggle
+                state.barge_in_enabled = not state.barge_in_enabled
+            elif setting.lower() in ("on", "true", "yes", "enable", "enabled"):
+                state.barge_in_enabled = True
+            elif setting.lower() in ("off", "false", "no", "disable", "disabled"):
+                state.barge_in_enabled = False
+            else:
+                await ctx.send("❌ Invalid setting. Use `!bargein on`, `!bargein off`, or just `!bargein` to toggle.")
+                return
+            
+            # Update the pipeline if it exists
+            if state.pipeline:
+                state.pipeline.set_barge_in_enabled(state.barge_in_enabled)
+            
+            status_text = "**enabled** 🛑" if state.barge_in_enabled else "**disabled** 🔇"
+            await ctx.send(f"🎙️ Barge-in (interruption) is now {status_text}")
+        
+        @self.command(name="assistant", help="Toggle assistant mode (wake word required)")
+        async def assistant(ctx: commands.Context, setting: str = None):
+            """Toggle or set assistant mode (only respond to 'Garvis...')."""
+            guild_id = ctx.guild.id
+            
+            if guild_id not in self._voice_states:
+                await ctx.send("❌ I'm not in a voice channel! Use `!join` first.")
+                return
+            
+            state = self._voice_states[guild_id]
+            
+            if setting is None:
+                # Toggle
+                state.assistant_mode = not state.assistant_mode
+            elif setting.lower() in ("on", "true", "yes", "enable", "enabled"):
+                state.assistant_mode = True
+            elif setting.lower() in ("off", "false", "no", "disable", "disabled"):
+                state.assistant_mode = False
+            else:
+                await ctx.send("❌ Invalid setting. Use `!assistant on`, `!assistant off`, or just `!assistant` to toggle.")
+                return
+            
+            # Update the pipeline if it exists
+            if state.pipeline:
+                state.pipeline.set_assistant_mode(state.assistant_mode)
+            
+            if state.assistant_mode:
+                status_text = f"**enabled** 🎯 - Say \"{WAKE_WORD.title()}...\" to get my attention"
+            else:
+                status_text = "**disabled** 👂 - I'll respond to everything"
+            await ctx.send(f"🤖 Assistant mode is now {status_text}")
+        
         @self.command(name="status", help="Show current status")
         async def status(ctx: commands.Context):
             """Show the bot's current status."""
@@ -291,6 +356,16 @@ class GarvisDiscordBot(commands.Bot):
             attr_status = "Enabled" if DISCORD_SPEAKER_ATTRIBUTION else "Disabled"
             status_parts.append(f"🏷️ Speaker attribution: **{attr_status}**")
             
+            # Barge-in status
+            bargein_status = "Enabled" if state.barge_in_enabled else "Disabled"
+            status_parts.append(f"🛑 Barge-in (interrupt): **{bargein_status}**")
+            
+            # Assistant mode status
+            if state.assistant_mode:
+                status_parts.append(f"🎯 Assistant mode: **Enabled** (say \"{WAKE_WORD.title()}...\")")
+            else:
+                status_parts.append("👂 Assistant mode: **Disabled** (responds to everything)")
+            
             await ctx.send("\n".join(status_parts))
     
     async def _start_listening(self, state: VoiceState, ctx: commands.Context):
@@ -323,6 +398,8 @@ class GarvisDiscordBot(commands.Bot):
             on_status=lambda listening, speaking: self._handle_status(ctx, listening, speaking),
             on_interrupt=lambda: self._handle_interrupt(state),  # Barge-in callback
             user_lookup=user_lookup,  # For speaker attribution
+            barge_in_enabled=state.barge_in_enabled,  # Initial barge-in setting
+            assistant_mode=state.assistant_mode,  # Wake word mode
         )
         
         # Start the pipeline
@@ -528,6 +605,8 @@ class GarvisDiscordBot(commands.Bot):
         print(f"     !mute @user   - Mute a user/bot (ignore their audio)")
         print(f"     !unmute @user - Unmute a user/bot")
         print(f"     !mute         - List currently muted users")
+        print(f"     !bargein      - Toggle barge-in (interrupt) on/off")
+        print(f"     !assistant    - Toggle assistant mode (wake word required)")
         print(f"     !status       - Show current status")
     
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):

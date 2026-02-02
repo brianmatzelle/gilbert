@@ -227,3 +227,12 @@ OPENCLAW_GATEWAY_URL = os.getenv("OPENCLAW_GATEWAY_URL", "http://127.0.0.1:18789
 OPENCLAW_GATEWAY_TOKEN = os.getenv("OPENCLAW_GATEWAY_TOKEN", "")
 OPENCLAW_AGENT_ID = os.getenv("OPENCLAW_AGENT_ID", "main")
 OPENCLAW_SESSION_KEY = os.getenv("OPENCLAW_SESSION_KEY", "discord-voice-main")
+
+# ========== Assistant Mode (Wake Word) ==========
+# When enabled, Garvis only responds when the user starts with "Garvis..."
+# Similar to Alexa - reduces unwanted responses and saves LLM compute
+ASSISTANT_MODE = os.getenv("ASSISTANT_MODE", "false").lower() == "true"
+
+# Wake word to listen for (case-insensitive)
+# Note: STT often transcribes "Jarvis" as "Garvis" due to normalization
+WAKE_WORD = os.getenv("WAKE_WORD", "garvis")

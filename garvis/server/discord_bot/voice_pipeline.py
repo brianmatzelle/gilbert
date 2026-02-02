@@ -94,6 +94,8 @@ from config import (
     USE_OPENCLAW,
     USE_KOKORO_TTS,
     DISCORD_SPEAKER_ATTRIBUTION,
+    ASSISTANT_MODE,
+    WAKE_WORD,
 )
 
 # Audio conversion - pydub requires ffmpeg
@@ -204,6 +206,8 @@ class DiscordVoicePipeline:
         on_status: Optional[Callable[[bool, bool], Awaitable[None]]] = None,
         on_interrupt: Optional[Callable[[], Awaitable[None]]] = None,
         user_lookup: Optional[Callable[[int], Optional[str]]] = None,
+        barge_in_enabled: bool = ENABLE_BARGE_IN,
+        assistant_mode: bool = ASSISTANT_MODE,
     ):
         """
         Args:
@@ -212,12 +216,16 @@ class DiscordVoicePipeline:
             on_status: Optional callback (listening, speaking)
             on_interrupt: Optional callback when barge-in interruption occurs (to stop Discord playback)
             user_lookup: Optional callback to get display name from user ID (for speaker attribution)
+            barge_in_enabled: Whether barge-in (interruption) is enabled
+            assistant_mode: Whether wake word is required (only respond to "Garvis...")
         """
         self.on_audio_output = on_audio_output
         self.on_transcript = on_transcript
         self.on_status = on_status
         self.on_interrupt = on_interrupt
         self.user_lookup = user_lookup
+        self._barge_in_enabled = barge_in_enabled
+        self._assistant_mode = assistant_mode
         
         self.stt: Optional[Union[DeepgramSTT, WhisperSTT]] = None
         self.llm: Optional[Union[ClaudeLLM, LocalLLM, OpenClawLLM]] = None
@@ -257,6 +265,18 @@ class DiscordVoicePipeline:
         self._use_local_tts = USE_LOCAL_TTS
         self._use_openclaw = USE_OPENCLAW
         self._use_kokoro_tts = USE_KOKORO_TTS
+    
+    def set_barge_in_enabled(self, enabled: bool):
+        """Enable or disable barge-in (interruption) at runtime."""
+        self._barge_in_enabled = enabled
+        status = "enabled" if enabled else "disabled"
+        print(f"🛑 Barge-in {status}")
+    
+    def set_assistant_mode(self, enabled: bool):
+        """Enable or disable assistant mode (wake word required) at runtime."""
+        self._assistant_mode = enabled
+        status = "enabled" if enabled else "disabled"
+        print(f"🎯 Assistant mode {status}")
     
     async def _execute_tool(self, tool_name: str, args: dict) -> str:
         """Execute a tool and return the result string."""
@@ -334,11 +354,15 @@ class DiscordVoicePipeline:
                 print("🔊 Using local TTS (Piper)")
                 self.tts = PiperTTS(on_audio=self._handle_tts_audio)
         else:
-            print("🔊 Using cloud TTS (ElevenLabs)")
+            print("🔊 Using cloud TTS (ElevenLabs - persistent connection)")
             self.tts = ElevenLabsTTS(on_audio=self._handle_tts_audio)
         
         # Connect to STT
         await self.stt.connect()
+        
+        # Connect TTS (ElevenLabs uses persistent WebSocket for lower latency)
+        if isinstance(self.tts, ElevenLabsTTS):
+            await self.tts.connect()
         
         print("🎤 Discord voice pipeline started")
         await self._send_status()
@@ -351,6 +375,9 @@ class DiscordVoicePipeline:
             await self.stt.disconnect()
         if self.tts:
             await self.tts.stop()
+            # Disconnect persistent TTS connections (ElevenLabs)
+            if hasattr(self.tts, 'disconnect'):
+                await self.tts.disconnect()
         if self.vad:
             self.vad.reset()
         
@@ -362,6 +389,10 @@ class DiscordVoicePipeline:
         
         Called when the user starts speaking while the bot is still responding.
         This allows natural conversation flow where users can interrupt.
+        
+        IMPORTANT: This also cleans up conversation_history to prevent the LLM
+        from seeing the interrupted exchange. The last user message is removed
+        since we didn't complete a proper response to it.
         """
         # Only interrupt if we're actually speaking
         if self._turn_state != TurnState.SPEAKING:
@@ -369,7 +400,7 @@ class DiscordVoicePipeline:
         
         print("🛑 Barge-in detected - interrupting response")
         
-        # Cancel LLM streaming
+        # Cancel LLM streaming FIRST to stop compute
         if self.llm:
             self.llm.cancel()
         
@@ -380,6 +411,14 @@ class DiscordVoicePipeline:
         # Clear TTS buffer
         self._tts_buffer.seek(0)
         self._tts_buffer.truncate()
+        
+        # ===== BARGE-IN FIX: Clean up conversation history =====
+        # Remove the last user message since we didn't complete a response to it
+        # This prevents the LLM from seeing incomplete exchanges and wasting compute
+        # on context that was never properly addressed
+        if self.conversation_history and self.conversation_history[-1]["role"] == "user":
+            removed_msg = self.conversation_history.pop()
+            print(f"🧹 Removed interrupted user message: '{removed_msg['content'][:50]}...'")
         
         # Clear any pending transcripts accumulated during bot speech
         self._pending_transcript = ""
@@ -458,7 +497,7 @@ class DiscordVoicePipeline:
         
         # Barge-in: If bot is speaking and user starts talking, interrupt the response
         # Only allow barge-in after minimum speaking time to avoid echo/feedback triggers
-        if ENABLE_BARGE_IN and self._turn_state == TurnState.SPEAKING:
+        if self._barge_in_enabled and self._turn_state == TurnState.SPEAKING:
             speaking_duration_ms = (time.time() - self._speaking_start_time) * 1000
             if speaking_duration_ms >= BARGE_IN_MIN_SPEAK_MS:
                 await self.interrupt()
@@ -582,6 +621,45 @@ class DiscordVoicePipeline:
             self.is_listening = True
             await self._send_status()
     
+    def _check_wake_word(self, transcript: str) -> tuple[bool, str]:
+        """
+        Check if transcript starts with the wake word.
+        
+        Returns:
+            (has_wake_word, cleaned_transcript)
+            - has_wake_word: True if wake word was found
+            - cleaned_transcript: Transcript with wake word stripped (if found)
+        """
+        transcript_lower = transcript.lower().strip()
+        wake_word_lower = WAKE_WORD.lower()
+        
+        # Check for wake word at the start (with some flexibility)
+        # "garvis", "garvis,", "garvis ", "hey garvis", etc.
+        patterns = [
+            f"{wake_word_lower} ",
+            f"{wake_word_lower},",
+            f"{wake_word_lower}.",
+            f"{wake_word_lower}?",
+            f"{wake_word_lower}!",
+            f"hey {wake_word_lower}",
+            f"hi {wake_word_lower}",
+            f"ok {wake_word_lower}",
+            f"okay {wake_word_lower}",
+        ]
+        
+        for pattern in patterns:
+            if transcript_lower.startswith(pattern):
+                # Find where the actual command starts
+                prefix_len = len(pattern)
+                cleaned = transcript[prefix_len:].lstrip(" ,.:!?")
+                return True, cleaned
+        
+        # Also check if transcript is JUST the wake word (user said "Garvis" and paused)
+        if transcript_lower.rstrip(" ,.:!?") == wake_word_lower:
+            return True, ""  # Wake word only, no command yet
+        
+        return False, transcript
+    
     async def _handle_speech_end(self, final_transcript: str, source: str = "deepgram"):
         """Handle end of user speech (from VAD or Deepgram's speech_final)."""
         if not final_transcript.strip():
@@ -606,6 +684,33 @@ class DiscordVoicePipeline:
         t_start = time.time()
         
         final_transcript = self._normalize_transcript(final_transcript)
+        
+        # ===== ASSISTANT MODE: Check for wake word =====
+        # If assistant mode is enabled, only respond when user says "Garvis..."
+        # This saves LLM compute by not processing unaddressed speech
+        if self._assistant_mode:
+            has_wake_word, cleaned_transcript = self._check_wake_word(final_transcript)
+            
+            if not has_wake_word:
+                # No wake word - ignore this input entirely (don't send to LLM)
+                print(f"🔇 Assistant mode: Ignoring '{final_transcript[:50]}...' (no wake word)")
+                async with self._state_lock:
+                    self._turn_state = TurnState.LISTENING
+                self._processing_response = False
+                return
+            
+            # Wake word found - use cleaned transcript
+            if cleaned_transcript:
+                final_transcript = cleaned_transcript
+                print(f"🎯 Wake word detected, processing: '{final_transcript[:50]}...'")
+            else:
+                # User just said "Garvis" with no command - acknowledge and wait
+                print(f"🎯 Wake word only - waiting for command...")
+                async with self._state_lock:
+                    self._turn_state = TurnState.LISTENING
+                self._processing_response = False
+                # TODO: Could play a "listening" sound here
+                return
         
         self.is_listening = False
         await self._send_status()

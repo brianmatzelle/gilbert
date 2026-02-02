@@ -1,7 +1,7 @@
 """
 Eleven Labs Real-time Text-to-Speech via WebSocket API
 
-This module provides real-time text-to-speech using ElevenLabs' WebSocket streaming API.
+This module provides real-time text-to-speech using ElevenLabs' Multi-Context WebSocket API.
 It's optimized for voice assistants where text arrives incrementally from an LLM.
 
 ARCHITECTURE:
@@ -15,12 +15,15 @@ ARCHITECTURE:
     └────────┬─────────┘
              │
              ▼ (buffered text)
-    ┌──────────────────┐
-    │  ElevenLabs WS   │  ← WebSocket with generation_config
-    │  (stream-input)  │     chunk_length_schedule: [50, 120, 200, 260]
-    └────────┬─────────┘
+    ┌──────────────────────────────────────────────────┐
+    │  ElevenLabs Multi-Context WebSocket (PERSISTENT) │
+    │  (multi-stream-input)                            │
+    │  - Single connection for entire session          │
+    │  - Multiple contexts for concurrent audio        │
+    │  - Keep-alive to prevent timeout                 │
+    └────────┬─────────────────────────────────────────┘
              │
-             ▼ (base64 MP3 chunks)
+             ▼ (base64 MP3 chunks per context)
     ┌──────────────────┐
     │   Audio Buffer   │  ← Prebuffer 8KB before playback
     └────────┬─────────┘
@@ -29,11 +32,12 @@ ARCHITECTURE:
     Voice Pipeline (converts MP3 → PCM for Discord)
 
 
-WHY WEBSOCKET INSTEAD OF HTTP?
-=============================
-1. Lower latency for streaming text input (text arrives word-by-word from LLM)
-2. Bidirectional - can receive audio while still sending text
-3. Better chunk scheduling with generation_config
+WHY MULTI-CONTEXT WEBSOCKET?
+============================
+1. PERSISTENT CONNECTION: No reconnect latency between responses (~200-500ms saved)
+2. Multiple "contexts" allow concurrent audio streams within one connection
+3. Graceful interruption handling - close old context, start new one
+4. Keep-alive mechanism prevents 20-second timeout
 
 WHY TEXT BUFFERING?
 ==================
@@ -54,6 +58,7 @@ MP3→PCM conversion is handled by the voice pipeline, not here.
 import asyncio
 import base64
 import json
+import uuid
 from collections import deque
 from typing import Callable, Awaitable, Optional
 
@@ -127,20 +132,26 @@ class AudioBuffer:
 
 class ElevenLabsTTS:
     """
-    Real-time text-to-speech using ElevenLabs WebSocket API.
+    Real-time text-to-speech using ElevenLabs Multi-Context WebSocket API.
     
     Key features:
-    - Uses WebSocket for bidirectional streaming (lowest latency)
-    - Direct PCM output (no MP3 conversion artifacts)
+    - PERSISTENT WebSocket connection (no reconnect latency between responses)
+    - Multiple contexts for concurrent/sequential audio generation
+    - Keep-alive mechanism to prevent timeout
+    - Graceful interruption handling
     - Text buffering to meet ElevenLabs' minimum chunk requirements
     - Jitter buffer for smooth playback
     """
     
-    WS_URL = "wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream-input"
+    # Multi-stream endpoint for persistent connections with multiple contexts
+    WS_URL = "wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/multi-stream-input"
     
     # ElevenLabs requires ~120 chars to start generating audio
     # We buffer text until we have enough, then send with flush=true
     MIN_TEXT_CHARS = 50  # Lower threshold since we use flush
+    
+    # Keep-alive interval (send ping before 20s timeout)
+    KEEP_ALIVE_INTERVAL = 15  # seconds
     
     def __init__(
         self,
@@ -155,95 +166,149 @@ class ElevenLabsTTS:
         self.voice_id = voice_id
         self.model_id = model_id
         
+        # Persistent WebSocket connection
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
+        self._connected = False
+        
+        # Background tasks
         self._receive_task: Optional[asyncio.Task] = None
         self._playback_task: Optional[asyncio.Task] = None
+        self._keepalive_task: Optional[asyncio.Task] = None
+        
+        # Current context for this speech generation
+        self._current_context_id: Optional[str] = None
         self._is_speaking = False
         self._stop_event = asyncio.Event()
         
         # Audio buffer for smooth playback (prebuffer ~8KB of MP3, roughly 500ms)
         self._audio_buffer = AudioBuffer(prebuffer_bytes=8000)
         
-        # Track if we've sent the initial handshake
-        self._initialized = False
-        
         # Text buffer - accumulate text before sending to ElevenLabs
         self._text_buffer = ""
+        
+        # Track completed contexts to filter late messages
+        self._completed_contexts: set[str] = set()
     
-    async def _connect(self):
-        """Connect to ElevenLabs WebSocket API."""
+    async def connect(self):
+        """
+        Establish persistent WebSocket connection to ElevenLabs.
+        Call this once when the voice pipeline starts (e.g., when joining voice channel).
+        """
+        if self._connected and self._ws:
+            return
+        
         url = self.WS_URL.format(voice_id=self.voice_id)
         
-        # Add query parameters for streaming
+        # Add query parameters - use longer inactivity timeout for persistent connection
         params = [
             f"model_id={self.model_id}",
             f"output_format={ELEVENLABS_OUTPUT_FORMAT}",
-            "inactivity_timeout=30",
+            "inactivity_timeout=180",  # Max timeout (3 minutes)
         ]
         url = f"{url}?{'&'.join(params)}"
         
-        print(f"🔊 Connecting to ElevenLabs WebSocket...")
-        self._ws = await websockets.connect(url)
+        print(f"🔊 Connecting to ElevenLabs WebSocket (persistent)...")
         
-        # Send initial handshake with voice settings and generation config
-        # Using smaller chunk_length_schedule for faster first audio
-        handshake = {
-            "text": " ",  # Initial space to start the connection
-            "voice_settings": {
-                "stability": 0.5,
-                "similarity_boost": 0.75,
-                "speed": 1.0,
-            },
-            "generation_config": {
-                "chunk_length_schedule": [50, 120, 200, 260]  # Lower thresholds for faster response
-            },
-            "xi_api_key": ELEVENLABS_API_KEY,
-        }
-        await self._ws.send(json.dumps(handshake))
-        self._initialized = True
-        print("✅ ElevenLabs WebSocket connected")
-    
-    async def _receive_audio(self):
-        """Task that receives audio from WebSocket and adds to jitter buffer."""
         try:
-            while not self._stop_event.is_set():
-                if not self._ws:
-                    break
+            self._ws = await websockets.connect(
+                url,
+                max_size=16 * 1024 * 1024,  # 16MB max message size
+                additional_headers={"xi-api-key": ELEVENLABS_API_KEY}
+            )
+            self._connected = True
+            print("✅ ElevenLabs WebSocket connected (persistent)")
+            
+            # Start background receive task
+            self._receive_task = asyncio.create_task(self._receive_loop())
+            
+            # Start keep-alive task
+            self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+            
+        except Exception as e:
+            print(f"❌ Failed to connect to ElevenLabs: {e}")
+            self._connected = False
+            raise
+    
+    async def _keepalive_loop(self):
+        """Send periodic keep-alive messages to prevent timeout."""
+        try:
+            while self._connected and self._ws:
+                await asyncio.sleep(self.KEEP_ALIVE_INTERVAL)
                 
+                if self._ws and self._connected:
+                    try:
+                        # Send a space to keep connection alive without generating audio
+                        # Only if we have a current context; otherwise the connection stays alive anyway
+                        if self._current_context_id:
+                            await self._ws.send(json.dumps({
+                                "context_id": self._current_context_id,
+                                "text": " ",  # Single space keeps context alive
+                            }))
+                    except Exception as e:
+                        print(f"⚠️ Keep-alive failed: {e}")
+                        await self._handle_disconnect()
+                        break
+        except asyncio.CancelledError:
+            pass
+    
+    async def _handle_disconnect(self):
+        """Handle unexpected disconnection."""
+        print("⚠️ ElevenLabs WebSocket disconnected")
+        self._connected = False
+        self._ws = None
+        
+        # Mark current context as finished if speaking
+        if self._is_speaking:
+            self._audio_buffer.mark_finished()
+    
+    async def _receive_loop(self):
+        """
+        Background task that receives all audio from WebSocket.
+        Filters messages by context_id to handle the current speech.
+        """
+        try:
+            while self._connected and self._ws:
                 try:
                     message = await asyncio.wait_for(
                         self._ws.recv(),
-                        timeout=0.1
+                        timeout=0.5
                     )
                     
                     data = json.loads(message)
+                    context_id = data.get("contextId", data.get("context_id"))
+                    
+                    # Ignore messages from completed/old contexts
+                    if context_id in self._completed_contexts:
+                        continue
                     
                     # Check for error
                     if "error" in data:
                         print(f"❌ ElevenLabs error: {data.get('error')} (code: {data.get('code')})")
+                        continue
                     
-                    # Check for audio data
-                    if "audio" in data and data["audio"]:
-                        audio_data = base64.b64decode(data["audio"])
-                        self._audio_buffer.add_audio(audio_data)
-                    
-                    # Check if this is the final chunk
-                    if data.get("isFinal", False):
-                        self._audio_buffer.mark_finished()
-                        break
+                    # Only process audio for current context
+                    if context_id == self._current_context_id:
+                        # Check for audio data
+                        if "audio" in data and data["audio"]:
+                            audio_data = base64.b64decode(data["audio"])
+                            self._audio_buffer.add_audio(audio_data)
+                        
+                        # Check if this is the final chunk for this context
+                        if data.get("isFinal", False) or data.get("is_final", False):
+                            self._audio_buffer.mark_finished()
+                            self._completed_contexts.add(context_id)
                 
                 except asyncio.TimeoutError:
                     continue
                 except websockets.exceptions.ConnectionClosed:
-                    print("⚠️ WebSocket connection closed")
+                    await self._handle_disconnect()
                     break
         
         except asyncio.CancelledError:
             pass
         except Exception as e:
             print(f"❌ WebSocket receive error: {e}")
-        finally:
-            self._audio_buffer.mark_finished()
+            await self._handle_disconnect()
     
     async def _playback_loop(self):
         """Task that plays buffered audio when ready."""
@@ -282,18 +347,43 @@ class ElevenLabsTTS:
         Add text to be converted to speech.
         Text is buffered and sent to ElevenLabs when we have enough.
         """
+        # Ensure we have a connection
+        if not self._connected or not self._ws:
+            await self.connect()
+        
         if not self._is_speaking:
-            # Start streaming on first text
+            # Start a new context for this speech
             self._is_speaking = True
             self._stop_event.clear()
             self._audio_buffer.reset()
             self._text_buffer = ""
             
-            # Connect to WebSocket
-            await self._connect()
+            # Generate unique context ID for this speech
+            self._current_context_id = f"ctx_{uuid.uuid4().hex[:8]}"
             
-            # Start receive and playback tasks
-            self._receive_task = asyncio.create_task(self._receive_audio())
+            # Send initial message to create context with voice settings
+            initial_message = {
+                "context_id": self._current_context_id,
+                "text": " ",  # Initial space to start the context
+                "voice_settings": {
+                    "stability": 0.5,
+                    "similarity_boost": 0.75,
+                    "speed": 1.0,
+                },
+                "generation_config": {
+                    "chunk_length_schedule": [50, 120, 200, 260]
+                },
+            }
+            
+            try:
+                await self._ws.send(json.dumps(initial_message))
+            except Exception as e:
+                print(f"❌ Failed to create context: {e}")
+                await self._handle_disconnect()
+                await self.connect()
+                await self._ws.send(json.dumps(initial_message))
+            
+            # Start playback task for this context
             self._playback_task = asyncio.create_task(self._playback_loop())
         
         # Buffer the text
@@ -305,7 +395,7 @@ class ElevenLabsTTS:
     
     async def _send_buffered_text(self, flush: bool = False):
         """Send buffered text to ElevenLabs."""
-        if not self._text_buffer or not self._ws or not self._initialized:
+        if not self._text_buffer or not self._ws or not self._current_context_id:
             return
         
         text_to_send = self._text_buffer
@@ -313,6 +403,7 @@ class ElevenLabsTTS:
         
         try:
             message = {
+                "context_id": self._current_context_id,
                 "text": text_to_send,
                 "flush": flush,  # Force generation even if below threshold
             }
@@ -321,7 +412,7 @@ class ElevenLabsTTS:
             print(f"⚠️ Error sending text to ElevenLabs: {e}")
     
     async def flush(self):
-        """Signal end of text and wait for audio to finish."""
+        """Signal end of text for current context and wait for audio to finish."""
         if not self._is_speaking:
             return
         
@@ -329,23 +420,15 @@ class ElevenLabsTTS:
         if self._text_buffer:
             await self._send_buffered_text(flush=True)
         
-        # Send end-of-stream signal
-        if self._ws and self._initialized:
+        # Close this context (signals end of this speech)
+        if self._ws and self._current_context_id:
             try:
-                await self._ws.send(json.dumps({"text": ""}))
+                await self._ws.send(json.dumps({
+                    "context_id": self._current_context_id,
+                    "close_context": True
+                }))
             except Exception as e:
-                print(f"⚠️ Error sending flush: {e}")
-        
-        # Wait for receive task to complete
-        if self._receive_task:
-            try:
-                await asyncio.wait_for(self._receive_task, timeout=10.0)
-            except asyncio.TimeoutError:
-                print("⚠️ Receive task timed out")
-                self._receive_task.cancel()
-            except asyncio.CancelledError:
-                pass
-            self._receive_task = None
+                print(f"⚠️ Error closing context: {e}")
         
         # Wait for playback to complete
         if self._playback_task:
@@ -358,31 +441,27 @@ class ElevenLabsTTS:
                 pass
             self._playback_task = None
         
-        # Close WebSocket
-        if self._ws:
-            try:
-                await self._ws.close()
-            except Exception:
-                pass
-            self._ws = None
-        
+        # Reset speaking state but keep connection open!
         self._is_speaking = False
-        self._initialized = False
+        self._current_context_id = None
         print("✅ TTS streaming complete")
     
     async def stop(self):
-        """Stop current TTS playback immediately."""
+        """Stop current TTS playback immediately (but keep connection open)."""
         self._stop_event.set()
         
-        # Cancel tasks
-        if self._receive_task:
-            self._receive_task.cancel()
+        # Close current context to stop generation
+        if self._ws and self._current_context_id:
             try:
-                await self._receive_task
-            except asyncio.CancelledError:
+                await self._ws.send(json.dumps({
+                    "context_id": self._current_context_id,
+                    "close_context": True
+                }))
+                self._completed_contexts.add(self._current_context_id)
+            except Exception:
                 pass
-            self._receive_task = None
         
+        # Cancel playback task
         if self._playback_task:
             self._playback_task.cancel()
             try:
@@ -391,17 +470,61 @@ class ElevenLabsTTS:
                 pass
             self._playback_task = None
         
-        # Close WebSocket
+        # Reset state but keep connection open
+        self._audio_buffer.reset()
+        self._text_buffer = ""
+        self._is_speaking = False
+        self._current_context_id = None
+        self._stop_event.clear()
+    
+    async def disconnect(self):
+        """
+        Close the persistent WebSocket connection.
+        Call this when leaving the voice channel.
+        """
+        print("🔌 Disconnecting from ElevenLabs...")
+        
+        # Cancel keep-alive task
+        if self._keepalive_task:
+            self._keepalive_task.cancel()
+            try:
+                await self._keepalive_task
+            except asyncio.CancelledError:
+                pass
+            self._keepalive_task = None
+        
+        # Cancel receive task
+        if self._receive_task:
+            self._receive_task.cancel()
+            try:
+                await self._receive_task
+            except asyncio.CancelledError:
+                pass
+            self._receive_task = None
+        
+        # Cancel playback task
+        if self._playback_task:
+            self._playback_task.cancel()
+            try:
+                await self._playback_task
+            except asyncio.CancelledError:
+                pass
+            self._playback_task = None
+        
+        # Close WebSocket gracefully
         if self._ws:
             try:
+                await self._ws.send(json.dumps({"close_socket": True}))
                 await self._ws.close()
             except Exception:
                 pass
             self._ws = None
         
-        # Reset state
+        # Reset all state
+        self._connected = False
         self._audio_buffer.reset()
         self._text_buffer = ""
         self._is_speaking = False
-        self._initialized = False
-        self._stop_event.clear()
+        self._current_context_id = None
+        self._completed_contexts.clear()
+        print("✅ Disconnected from ElevenLabs")
