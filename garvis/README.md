@@ -54,21 +54,54 @@ Built with [Deepgram](https://deepgram.com) • [Claude](https://anthropic.com) 
 
 ## Quick Start
 
-### Prerequisites
+### Docker (Recommended)
+
+The fastest way to deploy Garvis. Requires only [Docker](https://docs.docker.com/get-docker/).
+
+```bash
+# Clone the repository
+git clone https://github.com/yourusername/garvis.git
+cd garvis
+
+# Run the interactive setup wizard
+./setup.sh        # Linux/Mac
+.\setup.ps1       # Windows PowerShell
+
+# Start Garvis
+docker compose up -d
+
+# View logs
+docker compose logs -f
+```
+
+The setup wizard will guide you through:
+- Entering your Discord bot token
+- Choosing cloud mode (API keys) or local mode (GPU)
+- Configuring OpenClaw for persistent memory
+
+See [DEPLOY.md](DEPLOY.md) for the full deployment guide.
+
+---
+
+### Manual Installation (Development)
+
+For development or customization, you can run without Docker.
+
+#### Prerequisites
 
 | Requirement | Version | Notes |
 |-------------|---------|-------|
 | Python | 3.11-3.13 | 3.14 not yet supported |
 | uv | latest | [Install here](https://github.com/astral-sh/uv) |
 
-### API Keys Required
+#### API Keys Required
 
 - **[Anthropic](https://console.anthropic.com/)** — Claude API key
 - **[Deepgram](https://console.deepgram.com/)** — Speech-to-text API key
 - **[Eleven Labs](https://elevenlabs.io/)** — Text-to-speech API key
 - **[Discord](https://discord.com/developers/applications)** — Bot token
 
-### Installation
+#### Installation
 
 ```bash
 # 1. Clone the repository
@@ -83,7 +116,7 @@ cp server/env.example server/.env
 cd server && uv sync
 ```
 
-### Running
+#### Running
 
 ```bash
 # Linux/macOS

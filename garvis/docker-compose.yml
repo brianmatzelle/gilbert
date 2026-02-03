@@ -1,0 +1,61 @@
+# Garvis Discord Voice Assistant - Docker Compose
+#
+# Quick Start:
+#   1. Copy .env.docker.example to .env and fill in your API keys
+#   2. docker compose up -d
+#   3. docker compose logs -f
+#
+# For local models (GPU required):
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
+
+services:
+  garvis:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: garvis:latest
+    container_name: garvis
+    restart: unless-stopped
+    
+    # Environment configuration
+    env_file:
+      - .env
+    
+    # Override specific env vars for Docker networking
+    environment:
+      # Bot API listens on all interfaces inside container
+      - BOT_API_HOST=0.0.0.0
+      - BOT_API_PORT=8765
+      - BOT_API_ENABLED=true
+    
+    # Expose Bot API for OpenClaw integration
+    ports:
+      - "${BOT_API_PORT:-8765}:8765"
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8765/api/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    
+    # Resource limits (adjust as needed)
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+    
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# Named volumes for persistence (optional)
+volumes:
+  garvis-data:
+    driver: local

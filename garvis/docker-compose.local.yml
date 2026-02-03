@@ -1,0 +1,111 @@
+# Garvis Local Models Overlay - Docker Compose
+#
+# This overlay adds GPU support and local model services for fully offline operation.
+# Requires: NVIDIA GPU with CUDA support and nvidia-container-toolkit installed.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
+#
+# First time setup:
+#   ./download-models.sh  # Downloads ~6GB of models
+
+services:
+  # Override garvis service to add GPU support and local model settings
+  garvis:
+    # Use GPU-enabled base image for local STT/VAD
+    build:
+      context: .
+      dockerfile: Dockerfile.local
+    
+    # Mount models directory
+    volumes:
+      - ./models:/app/models:ro
+    
+    # Environment overrides for local mode
+    environment:
+      - USE_LOCAL_LLM=true
+      - USE_LOCAL_STT=true
+      - USE_LOCAL_TTS=true
+      - USE_KOKORO_TTS=true
+      - USE_CUDA=true
+      # Local LLM endpoint (llama-server container)
+      - LOCAL_LLM_URL=http://llama-server:8080/v1
+      # Model paths (mounted volume)
+      - WHISPER_MODEL=small
+      - PIPER_MODEL_PATH=/app/models/piper/en_US-lessac-medium.onnx
+      - KOKORO_MODEL_PATH=/app/models/kokoro/kokoro-v1.0.onnx
+      - KOKORO_VOICES_PATH=/app/models/kokoro/voices-v1.0.bin
+      - KOKORO_VOICE=af_heart
+    
+    # GPU access for Silero VAD and Whisper
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+        limits:
+          memory: 4G
+    
+    # Wait for llama-server to be ready
+    depends_on:
+      llama-server:
+        condition: service_healthy
+
+  # llama.cpp server for local LLM inference
+  llama-server:
+    image: ghcr.io/ggerganov/llama.cpp:server-cuda
+    container_name: garvis-llama
+    restart: unless-stopped
+    
+    # Mount models directory
+    volumes:
+      - ./models:/models:ro
+    
+    # llama.cpp server configuration
+    command: >
+      --model /models/llm/Qwen2.5-7B-Instruct-Q4_K_M.gguf
+      --host 0.0.0.0
+      --port 8080
+      --n-gpu-layers 99
+      --ctx-size 8192
+      --batch-size 512
+      --threads 4
+      --parallel 1
+      --cont-batching
+    
+    # Expose port for debugging (optional, remove in production)
+    ports:
+      - "8080:8080"
+    
+    # GPU access
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+        limits:
+          memory: 8G
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s  # Model loading takes time
+    
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# Models volume
+volumes:
+  garvis-models:
+    driver: local
