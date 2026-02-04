@@ -1,0 +1,42 @@
+[project]
+name = "cortana"
+version = "0.1.0"
+description = "Lightweight Discord Voice Bot with local AI stack"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # Discord
+    "py-cord[voice]>=2.4.0",
+    
+    # LLM - Ollama
+    "ollama>=0.4.0",
+    
+    # STT - Whisper
+    "faster-whisper>=1.0.0",
+    
+    # TTS - Kokoro
+    "kokoro-onnx>=0.4.0",
+    
+    # VAD - Silero (uses PyTorch)
+    "torch>=2.0.0",
+    
+    # Audio processing
+    "pydub>=0.25.0",
+    "numpy>=1.24.0",
+    
+    # Config
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+cuda = [
+    # For GPU acceleration
+    "torch>=2.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+dev-dependencies = []
