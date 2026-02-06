@@ -7,7 +7,6 @@ Optimized for Qwen2.5-7B-Instruct running on llama.cpp with CUDA.
 """
 
 import json
-import re
 from typing import AsyncGenerator, Optional, Callable, Awaitable
 from openai import AsyncOpenAI
 
@@ -127,22 +126,29 @@ class LocalLLM:
         """
         Stream a response from the local LLM with tool calling support.
         
+        Text is streamed in real-time for low-latency TTS.  When the
+        model calls a tool, we execute it locally and feed the result
+        back for a follow-up streamed response.
+        
         Args:
             conversation_history: List of messages
-            tool_executor: Async function to execute tools: (tool_name, args) -> result string
+            tool_executor: Async function: (tool_name, args_dict) -> result string
             max_tokens: Maximum tokens in response
-            max_tool_iterations: Maximum number of tool call rounds
+            max_tool_iterations: Max tool→response round-trips
             
         Yields:
             Dicts with:
                 - {"type": "text", "content": "..."} for text chunks
-                - {"type": "tool_use", "name": "...", "input": {...}} when tool is called
-                - {"type": "tool_result", "name": "...", "result": "..."} after tool execution
-                - {"type": "stream_url", "url": "..."} when [DISPLAY_STREAM:url] is detected
+                - {"type": "tool_use", "name": "...", "input": {...}} when a tool is called
+                - {"type": "tool_result", "name": "...", "result": "..."} after execution
         """
+        self._cancel_requested = False
+        
         # Build messages with system prompt
         messages = [{"role": "system", "content": self.system_prompt}]
-        messages.extend(conversation_history)
+        max_messages = MAX_CONVERSATION_TURNS * 2
+        recent = conversation_history[-max_messages:] if len(conversation_history) > max_messages else conversation_history
+        messages.extend(recent)
         
         iterations = 0
         
@@ -150,96 +156,105 @@ class LocalLLM:
             iterations += 1
             
             try:
-                # Make API call with tools
-                response = await self.client.chat.completions.create(
+                # Stream the response so text arrives in real-time
+                stream = await self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
                     max_tokens=max_tokens,
                     tools=self.tools if self.tools else None,
-                    tool_choice="auto" if self.tools else None
+                    tool_choice="auto" if self.tools else None,
+                    stream=True,
                 )
                 
-                choice = response.choices[0]
-                message = choice.message
+                text_content = ""
+                # Accumulate tool calls streamed incrementally
+                tool_calls_acc: dict[int, dict] = {}
+                finish_reason = None
                 
-                # Process text content
-                text_content = message.content or ""
-                if text_content:
-                    yield {"type": "text", "content": text_content}
+                async for chunk in stream:
+                    if self._cancel_requested:
+                        print("🛑 LLM stream cancelled (barge-in)")
+                        break
                     
-                    # Check for stream URL in text content
-                    if "[DISPLAY_STREAM:" in text_content:
-                        match = re.search(r'\[DISPLAY_STREAM:([^\]]+)\]', text_content)
-                        if match:
-                            yield {"type": "stream_url", "url": match.group(1)}
+                    if not chunk.choices:
+                        continue
+                    
+                    choice = chunk.choices[0]
+                    delta = choice.delta
+                    
+                    # ---- streamed text ----
+                    if delta.content:
+                        text_content += delta.content
+                        yield {"type": "text", "content": delta.content}
+                    
+                    # ---- streamed tool_calls (incremental) ----
+                    if delta.tool_calls:
+                        for tc in delta.tool_calls:
+                            idx = tc.index if tc.index is not None else 0
+                            if idx not in tool_calls_acc:
+                                tool_calls_acc[idx] = {"id": "", "name": "", "arguments": ""}
+                            if tc.id:
+                                tool_calls_acc[idx]["id"] = tc.id
+                            if tc.function:
+                                if tc.function.name:
+                                    tool_calls_acc[idx]["name"] += tc.function.name
+                                if tc.function.arguments:
+                                    tool_calls_acc[idx]["arguments"] += tc.function.arguments
+                    
+                    if choice.finish_reason:
+                        finish_reason = choice.finish_reason
                 
-                # Check for tool calls
-                tool_calls = message.tool_calls or []
-                
-                if not tool_calls:
-                    # No tool calls, we're done
+                if self._cancel_requested:
                     break
                 
-                # Process tool calls
-                for tool_call in tool_calls:
-                    tool_name = tool_call.function.name
-                    try:
-                        tool_args = json.loads(tool_call.function.arguments)
-                    except json.JSONDecodeError:
-                        tool_args = {}
-                    
-                    yield {"type": "tool_use", "name": tool_name, "input": tool_args}
-                    
-                    # Execute the tool
-                    result = await tool_executor(tool_name, tool_args)
-                    
-                    yield {"type": "tool_result", "name": tool_name, "result": result}
-                    
-                    # Check for stream URL in tool result
-                    if "[DISPLAY_STREAM:" in result:
-                        match = re.search(r'\[DISPLAY_STREAM:([^\]]+)\]', result)
-                        if match:
-                            yield {"type": "stream_url", "url": match.group(1)}
+                # No tool calls → we're done
+                if not tool_calls_acc or finish_reason not in ("tool_calls", "function_call"):
+                    break
                 
-                # Add assistant message and tool results to messages for next iteration
-                messages.append({
+                # -- execute tools locally and feed results back --
+                
+                # 1) Add assistant message (text + tool_calls)
+                assistant_msg: dict = {
                     "role": "assistant",
-                    "content": text_content,
+                    "content": text_content or None,
                     "tool_calls": [
                         {
-                            "id": tc.id,
+                            "id": tc_data["id"],
                             "type": "function",
                             "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments
-                            }
+                                "name": tc_data["name"],
+                                "arguments": tc_data["arguments"],
+                            },
                         }
-                        for tc in tool_calls
-                    ]
-                })
+                        for _, tc_data in sorted(tool_calls_acc.items())
+                    ],
+                }
+                messages.append(assistant_msg)
                 
-                # Add tool results
-                for tool_call in tool_calls:
-                    tool_name = tool_call.function.name
+                # 2) Execute each tool once and append results
+                for _, tc_data in sorted(tool_calls_acc.items()):
+                    name = tc_data["name"]
                     try:
-                        tool_args = json.loads(tool_call.function.arguments)
+                        args = json.loads(tc_data["arguments"])
                     except json.JSONDecodeError:
-                        tool_args = {}
-                    result = await tool_executor(tool_name, tool_args)
+                        args = {}
+                    
+                    yield {"type": "tool_use", "name": name, "input": args}
+                    result = await tool_executor(name, args)
+                    yield {"type": "tool_result", "name": name, "result": result}
                     
                     messages.append({
                         "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": result
+                        "tool_call_id": tc_data["id"],
+                        "content": result,
                     })
                 
-                # Check finish reason
-                if choice.finish_reason == "stop":
-                    break
+                # Loop continues → next iteration streams the follow-up
             
             except Exception as e:
-                print(f"❌ Local LLM error: {e}")
-                yield {"type": "text", "content": f"I apologize, but I encountered an error: {str(e)}"}
+                if not self._cancel_requested:
+                    print(f"❌ Local LLM error: {e}")
+                    yield {"type": "text", "content": f"I apologize, but I encountered an error: {str(e)}"}
                 break
     
     async def get_response(

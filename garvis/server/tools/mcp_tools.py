@@ -62,3 +62,38 @@ def register_tools(mcp: FastMCP):
             "service": "Garvis Voice Server",
             "version": "0.1.0"
         }
+
+    # ── Music Playback Tools ────────────────────────────────────────────
+
+    @mcp.tool()
+    async def play_music(url: str) -> dict:
+        """Play music from a URL in the current voice channel.
+        
+        Supports YouTube, SoundCloud, and many other sites.
+        If music is already playing, it will be replaced with the new song.
+        
+        Args:
+            url: The URL of the song to play (e.g. a YouTube link).
+            
+        Returns:
+            Status dict with title, duration, and playback status.
+        """
+        # This is a stub -- actual execution happens in voice_pipeline._execute_tool()
+        # which has access to the MusicPlayer instance.
+        return {"status": "error", "error": "No active voice session"}
+
+    @mcp.tool()
+    async def stop_music() -> dict:
+        """Stop the currently playing music and clear the queue."""
+        return {"status": "error", "error": "No active voice session"}
+
+    @mcp.tool()
+    async def set_music_volume(volume: float) -> dict:
+        """Set the music playback volume.
+        
+        Args:
+            volume: Volume level from 0.0 (silent) to 1.0 (full volume).
+                    Default is 0.3. When Garvis speaks, music is automatically
+                    ducked to a lower volume.
+        """
+        return {"status": "error", "error": "No active voice session"}

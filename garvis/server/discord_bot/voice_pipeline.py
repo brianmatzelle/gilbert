@@ -97,6 +97,8 @@ from config import (
     ASSISTANT_MODE,
     WAKE_WORD,
     MAX_CONVERSATION_TURNS,
+    CONVERSATION_RESPONSE_DELAY_MS,
+    CONVERSATION_MAX_WAIT_MS,
 )
 
 # Audio conversion - pydub requires ffmpeg
@@ -211,6 +213,7 @@ class DiscordVoicePipeline:
         user_lookup: Optional[Callable[[int], Optional[str]]] = None,
         barge_in_enabled: bool = ENABLE_BARGE_IN,
         assistant_mode: bool = ASSISTANT_MODE,
+        music_player=None,
     ):
         """
         Args:
@@ -222,6 +225,7 @@ class DiscordVoicePipeline:
             user_lookup: Optional callback to get display name from user ID (for speaker attribution)
             barge_in_enabled: Whether barge-in (interruption) is enabled
             assistant_mode: Whether wake word is required (only respond to "Garvis...")
+            music_player: Optional MusicPlayer instance for music playback tools
         """
         self.on_audio_output = on_audio_output
         self.on_transcript = on_transcript
@@ -231,6 +235,7 @@ class DiscordVoicePipeline:
         self.user_lookup = user_lookup
         self._barge_in_enabled = barge_in_enabled
         self._assistant_mode = assistant_mode
+        self._music_player = music_player
         
         self.stt: Optional[Union[DeepgramSTT, WhisperSTT]] = None
         self.llm: Optional[Union[ClaudeLLM, LocalLLM, OpenClawLLM]] = None
@@ -260,6 +265,19 @@ class DiscordVoicePipeline:
         # Incomplete utterance handling
         self._incomplete_utterance_detected = False
         self._extended_silence_task: Optional[asyncio.Task] = None
+        
+        # ===== Multi-speaker support =====
+        # Per-user silence tracking: detect when individual users stop speaking,
+        # even if others continue.  This is the key fix for group conversations
+        # where the global VAD never fires speech_end.
+        self._user_last_audio: dict[int, float] = {}          # user_id → timestamp of last audio
+        self._users_speaking: set[int] = set()                 # user IDs currently producing audio
+        self._user_silence_tasks: dict[int, asyncio.Task] = {} # per-user silence timers
+        
+        # Conversation response timer: gives a short window for multiple speakers
+        # to finish before Garvis responds
+        self._response_timer_task: Optional[asyncio.Task] = None
+        self._first_transcript_time: float = 0.0  # When transcript accumulation started this cycle
         
         # Audio buffer for TTS conversion (MP3 for cloud, WAV for local)
         self._tts_buffer = io.BytesIO()
@@ -291,15 +309,34 @@ class DiscordVoicePipeline:
     
     async def _execute_tool(self, tool_name: str, args: dict) -> str:
         """Execute a tool and return the result string."""
+        import json as _json
         print(f"🔧 Executing tool: {tool_name} with args: {args}")
         
         try:
             if tool_name == "ping":
-                import json
-                return json.dumps({
+                return _json.dumps({
                     "status": "pong",
                     "service": "Garvis Discord Bot"
                 })
+            
+            # ── Music playback tools ────────────────────────────────
+            elif tool_name == "play_music":
+                if not self._music_player:
+                    return _json.dumps({"status": "error", "error": "Music playback not available"})
+                result = await self._music_player.play(args.get("url", ""))
+                return _json.dumps(result)
+            
+            elif tool_name == "stop_music":
+                if not self._music_player:
+                    return _json.dumps({"status": "error", "error": "Music playback not available"})
+                result = await self._music_player.stop()
+                return _json.dumps(result)
+            
+            elif tool_name == "set_music_volume":
+                if not self._music_player:
+                    return _json.dumps({"status": "error", "error": "Music playback not available"})
+                result = await self._music_player.set_volume(float(args.get("volume", 0.3)))
+                return _json.dumps(result)
             
             else:
                 return f"Unknown tool: {tool_name}"
@@ -386,6 +423,14 @@ class DiscordVoicePipeline:
     async def stop(self):
         """Clean up pipeline resources."""
         self._running = False
+        
+        # Clean up per-user silence tasks and response timer
+        for task in self._user_silence_tasks.values():
+            if not task.done():
+                task.cancel()
+        self._user_silence_tasks.clear()
+        if self._response_timer_task and not self._response_timer_task.done():
+            self._response_timer_task.cancel()
         
         if self.stt:
             await self.stt.disconnect()
@@ -509,6 +554,16 @@ class DiscordVoicePipeline:
         if self.stt:
             self.stt.current_transcript = ""
         
+        # Reset multi-speaker state
+        self._first_transcript_time = 0.0
+        self._users_speaking.clear()
+        for task in self._user_silence_tasks.values():
+            if not task.done():
+                task.cancel()
+        self._user_silence_tasks.clear()
+        if self._response_timer_task and not self._response_timer_task.done():
+            self._response_timer_task.cancel()
+        
         # Reset state to allow new processing
         self._processing_response = False
         self.is_speaking = False
@@ -542,6 +597,27 @@ class DiscordVoicePipeline:
                 self._current_speaker_name = self.user_lookup(user_id)
             else:
                 self._current_speaker_name = None
+        
+        # ===== Per-user silence tracking (multi-speaker fix) =====
+        # Track when each user last sent audio.  When a specific user goes
+        # silent for VAD_MIN_SILENCE_MS, we know *they* finished speaking --
+        # even if other users are still talking.  This is the parallel trigger
+        # path that complements the global VAD (which only fires when ALL
+        # audio stops).
+        if user_id is not None:
+            self._user_last_audio[user_id] = time.time()
+            self._users_speaking.add(user_id)
+            
+            # Cancel existing silence timer for this user and start a new one
+            old_task = self._user_silence_tasks.get(user_id)
+            if old_task and not old_task.done():
+                old_task.cancel()
+            
+            # Capture speaker name now (may change by the time timer fires)
+            speaker_name = self._current_speaker_name
+            self._user_silence_tasks[user_id] = asyncio.create_task(
+                self._on_user_silence(user_id, speaker_name)
+            )
         
         # Process through local VAD for speaking state (non-blocking)
         if self.vad and self.vad.is_available:
@@ -703,14 +779,139 @@ class DiscordVoicePipeline:
             # User started speaking again - good, we didn't interrupt them
             print("🔄 Extended silence cancelled - user continued speaking")
     
+    # ===== Multi-speaker conversation support =====
+    # These methods provide an alternative trigger path for group conversations
+    # where the global VAD never fires speech_end because someone is always talking.
+    
+    async def _on_user_silence(self, user_id: int, speaker_name: Optional[str]):
+        """
+        Per-user silence detection.
+        
+        Fires when a specific user hasn't sent audio for VAD_MIN_SILENCE_MS.
+        In a group conversation this means *that* user finished their thought,
+        even if others are still talking.
+        
+        Two outcomes:
+        - ALL users silent → respond immediately (same as current 1-on-1 path)
+        - Some users still talking → start a response delay timer so Garvis
+          waits briefly for the conversation to settle before jumping in
+        """
+        try:
+            await asyncio.sleep(VAD_MIN_SILENCE_MS / 1000.0)
+        except asyncio.CancelledError:
+            return  # User resumed speaking – timer reset by process_audio
+        
+        # Mark this user as no longer speaking
+        self._users_speaking.discard(user_id)
+        
+        # Don't trigger if already processing or not in listening state
+        if self._processing_response or self._turn_state != TurnState.LISTENING:
+            return
+        
+        transcript = self._pending_transcript.strip()
+        if not transcript:
+            return
+        
+        if not self._users_speaking:
+            # ── All users are now silent ──
+            # Let the existing VAD path handle this case (it fires at roughly
+            # the same time).  This avoids duplicating the incomplete-utterance
+            # logic.  If for some reason the VAD doesn't fire (no trailing
+            # audio from Discord), the response timer below acts as a backstop.
+            
+            # Start a short backstop timer in case the global VAD doesn't fire
+            if not self._response_timer_task or self._response_timer_task.done():
+                self._response_timer_task = asyncio.create_task(
+                    self._conversation_response_timer(source="all-silent-backstop")
+                )
+        else:
+            # ── Other users still talking ──
+            # This is the key multi-speaker path.  Start a response timer
+            # so Garvis waits a beat for the conversation to settle, then
+            # responds even though others haven't stopped.
+            if not self._response_timer_task or self._response_timer_task.done():
+                names = speaker_name or str(user_id)
+                print(f"👤 {names} finished speaking, others still active – starting response timer ({CONVERSATION_RESPONSE_DELAY_MS}ms)")
+                self._response_timer_task = asyncio.create_task(
+                    self._conversation_response_timer(source="multi-speaker")
+                )
+    
+    async def _conversation_response_timer(self, source: str = "timer"):
+        """
+        Delayed response trigger for multi-speaker conversations.
+        
+        Waits CONVERSATION_RESPONSE_DELAY_MS then triggers a response with
+        whatever transcript has accumulated, bypassing the global VAD.
+        """
+        try:
+            await asyncio.sleep(CONVERSATION_RESPONSE_DELAY_MS / 1000.0)
+        except asyncio.CancelledError:
+            return
+        
+        # Re-check state (may have changed during sleep)
+        if self._processing_response or self._turn_state != TurnState.LISTENING:
+            return
+        
+        transcript = self._pending_transcript.strip()
+        if not transcript:
+            return
+        
+        print(f"⏰ Conversation response timer fired ({source}) – responding to: '{transcript[:60]}...'")
+        
+        # Record trigger time (blocks redundant Deepgram/VAD triggers)
+        self._last_vad_trigger_time = time.time()
+        self._t_speech_end = time.time()
+        
+        # Clear transcript state for next cycle
+        self._pending_transcript = ""
+        self._first_transcript_time = 0.0
+        if self.stt:
+            self.stt.current_transcript = ""
+        
+        await self._handle_speech_end(transcript, source=f"conversation-{source}")
+    
     async def _handle_transcript(self, text: str, is_final: bool):
-        """Handle transcript updates from Deepgram."""
+        """Handle transcript updates from STT (Deepgram or Whisper)."""
         text = self._normalize_transcript(text)
         self.current_transcript = text
         
         # Store the latest transcript for VAD-triggered responses
         if text.strip():
             self._pending_transcript = text
+            
+            # Track when transcript accumulation started this cycle
+            # (reset to 0 after each response in _handle_speech_end)
+            if self._first_transcript_time == 0.0:
+                self._first_transcript_time = time.time()
+            
+            # ===== Max-wait backstop =====
+            # If transcript has been accumulating for too long without a
+            # response (nobody ever shuts up), force a response now.
+            # This is the hard cap that guarantees Garvis eventually speaks.
+            if (
+                self._first_transcript_time > 0
+                and not self._processing_response
+                and self._turn_state == TurnState.LISTENING
+            ):
+                elapsed_ms = (time.time() - self._first_transcript_time) * 1000
+                if elapsed_ms >= CONVERSATION_MAX_WAIT_MS:
+                    transcript = self._pending_transcript.strip()
+                    if transcript:
+                        print(f"⏰ Max wait ({CONVERSATION_MAX_WAIT_MS}ms) exceeded – forcing response")
+                        
+                        self._last_vad_trigger_time = time.time()
+                        self._t_speech_end = time.time()
+                        self._pending_transcript = ""
+                        self._first_transcript_time = 0.0
+                        if self.stt:
+                            self.stt.current_transcript = ""
+                        
+                        # Cancel any pending response timer
+                        if self._response_timer_task and not self._response_timer_task.done():
+                            self._response_timer_task.cancel()
+                        
+                        await self._handle_speech_end(transcript, source="max-wait")
+                        return  # Don't fall through to the callback below
         
         if self.on_transcript:
             await self.on_transcript(text, "user", is_final)
@@ -813,8 +1014,11 @@ class DiscordVoicePipeline:
         self.is_listening = False
         await self._send_status()
         
-        # Reset VAD state for next utterance
-        if self.vad:
+        # Reset VAD state for next utterance – but only when all users are
+        # actually silent.  In multi-speaker conversations we may start a
+        # response while others are still talking; resetting the VAD mid-speech
+        # would cause a false speech_start → spurious barge-in.
+        if self.vad and not self._users_speaking:
             self.vad.reset()
         
         # Format message with speaker attribution if enabled
@@ -848,15 +1052,26 @@ class DiscordVoicePipeline:
         self._t_first_tts_audio = 0.0
         self._convert_time_total_ms = 0.0
         
-        # Stream LLM response directly to TTS for minimum latency
-        # This uses the simple streaming method (no tools) for fastest response
-        async for chunk in self.llm.stream_response(self.conversation_history):
-            assistant_response += chunk
-            # Stream each chunk to TTS immediately
-            await self.tts.add_text(chunk)
-            if t_first_chunk is None:
-                t_first_chunk = time.time()
-                print(f"⏱️ LLM TTFC: {(t_first_chunk - t_llm_start)*1000:.0f}ms")
+        # Stream LLM response with tool support
+        # Text chunks stream directly to TTS for low latency.
+        # If the LLM calls a tool (e.g. play_music), _execute_tool() runs
+        # and the result is fed back to the LLM for a follow-up response.
+        async for event in self.llm.stream_response_with_tools(
+            self.conversation_history,
+            self._execute_tool,
+        ):
+            if event.get("type") == "text":
+                chunk = event["content"]
+                assistant_response += chunk
+                # Stream each text chunk to TTS immediately
+                await self.tts.add_text(chunk)
+                if t_first_chunk is None:
+                    t_first_chunk = time.time()
+                    print(f"⏱️ LLM TTFC: {(t_first_chunk - t_llm_start)*1000:.0f}ms")
+            elif event.get("type") == "tool_use":
+                print(f"🔧 Tool call: {event.get('name')} ({event.get('input', {})})")
+            elif event.get("type") == "tool_result":
+                print(f"🔧 Tool result: {event.get('name')} → {str(event.get('result', ''))[:100]}")
         
         t_llm_end = time.time()
         
@@ -912,6 +1127,11 @@ class DiscordVoicePipeline:
         self._pending_transcript = ""
         if self.stt:
             self.stt.current_transcript = ""
+        
+        # Reset multi-speaker state for next conversation cycle
+        self._first_transcript_time = 0.0
+        if self._response_timer_task and not self._response_timer_task.done():
+            self._response_timer_task.cancel()
         
         async with self._state_lock:
             self._turn_state = TurnState.LISTENING

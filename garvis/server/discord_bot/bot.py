@@ -6,7 +6,6 @@ Integrates with the Garvis voice pipeline (Deepgram STT → Claude → ElevenLab
 """
 
 import asyncio
-import io
 import sys
 from typing import Optional, Dict
 from pathlib import Path
@@ -38,8 +37,13 @@ from config import (
     BOT_API_ENABLED,
     BOT_API_HOST,
     BOT_API_PORT,
+    MUSIC_ENABLED,
+    MUSIC_DEFAULT_VOLUME,
+    MUSIC_DUCK_VOLUME,
 )
 from .audio_sink import GarvisAudioSink
+from .audio_mixer import MixingAudioSource
+from .music_player import MusicPlayer
 from .voice_pipeline import DiscordVoicePipeline
 from .api_server import BotAPIServer
 
@@ -89,9 +93,9 @@ class VoiceState:
         self.muted_user_ids: set = set(DISCORD_MUTED_USERS_SET)  # Users/bots to ignore
         self.barge_in_enabled: bool = ENABLE_BARGE_IN  # Allow interrupting responses
         self.assistant_mode: bool = ASSISTANT_MODE  # Only respond to wake word
-        self._audio_buffer = io.BytesIO()  # Accumulate audio for smooth playback
-        self._playback_task: Optional[asyncio.Task] = None
-        self._playback_lock = asyncio.Lock()  # Prevent concurrent playback issues
+        # Audio mixer: persistent source that combines TTS + music
+        self.audio_mixer: Optional[MixingAudioSource] = None
+        self.music_player: Optional[MusicPlayer] = None
 
 
 class GarvisDiscordBot(commands.Bot):
@@ -403,9 +407,28 @@ class GarvisDiscordBot(commands.Bot):
             await state.pipeline.stop()
             state.pipeline = None
         
-        # Clear the audio buffer
-        state._audio_buffer.seek(0)
-        state._audio_buffer.truncate()
+        # Clean up old mixer/music player
+        if state.music_player:
+            state.music_player.cleanup()
+            state.music_player = None
+        if state.audio_mixer:
+            state.audio_mixer.cleanup()
+            state.audio_mixer = None
+        
+        # Create the audio mixer (persistent source that combines TTS + music)
+        state.audio_mixer = MixingAudioSource(
+            music_volume=MUSIC_DEFAULT_VOLUME,
+            duck_volume=MUSIC_DUCK_VOLUME,
+        )
+        
+        # Create the music player (linked to the mixer)
+        if MUSIC_ENABLED:
+            state.music_player = MusicPlayer(state.audio_mixer)
+        
+        # Start the persistent mixer on the voice connection
+        # It outputs silence when idle, so the connection stays alive
+        if state.voice_client:
+            state.voice_client.play(state.audio_mixer)
         
         # Create user lookup function for speaker attribution
         def user_lookup(user_id: int) -> Optional[str]:
@@ -423,6 +446,7 @@ class GarvisDiscordBot(commands.Bot):
             user_lookup=user_lookup,  # For speaker attribution
             barge_in_enabled=state.barge_in_enabled,  # Initial barge-in setting
             assistant_mode=state.assistant_mode,  # Wake word mode
+            music_player=state.music_player,  # Music playback tools
         )
         
         # Start the pipeline
@@ -462,7 +486,8 @@ class GarvisDiscordBot(commands.Bot):
             print(f"🔇 Muted users: {', '.join(muted_names)}")
         
         speaker_mode = "enabled" if DISCORD_SPEAKER_ATTRIBUTION else "disabled"
-        print(f"🎤 Started listening in {ctx.guild.name} (speaker attribution: {speaker_mode})")
+        music_status = "enabled" if MUSIC_ENABLED else "disabled"
+        print(f"🎤 Started listening in {ctx.guild.name} (speaker attribution: {speaker_mode}, music: {music_status})")
     
     async def _stop_listening(self, state: VoiceState):
         """Stop the voice pipeline and audio capture."""
@@ -479,9 +504,13 @@ class GarvisDiscordBot(commands.Bot):
             await state.pipeline.stop()
             state.pipeline = None
         
-        if state._playback_task:
-            state._playback_task.cancel()
-            state._playback_task = None
+        # Clean up music player and mixer
+        if state.music_player:
+            state.music_player.cleanup()
+            state.music_player = None
+        if state.audio_mixer:
+            state.audio_mixer.cleanup()
+            state.audio_mixer = None
         
         print("🔌 Stopped listening")
     
@@ -490,7 +519,7 @@ class GarvisDiscordBot(commands.Bot):
         if guild_id in self._voice_states:
             state = self._voice_states[guild_id]
             
-            # Stop listening first (this stops recording)
+            # Stop listening first (this stops recording + cleans up mixer/music)
             await self._stop_listening(state)
             
             # Disconnect from voice
@@ -498,10 +527,6 @@ class GarvisDiscordBot(commands.Bot):
                 if state.voice_client.is_connected():
                     await state.voice_client.disconnect()
                 state.voice_client = None
-            
-            # Clear the audio buffer
-            state._audio_buffer.seek(0)
-            state._audio_buffer.truncate()
             
             if ctx:
                 await ctx.send("👋 Left the voice channel. See you later!")
@@ -526,64 +551,39 @@ class GarvisDiscordBot(commands.Bot):
             if state.pipeline:
                 await state.pipeline.stop()
                 state.pipeline = None
+            if state.music_player:
+                state.music_player.cleanup()
+                state.music_player = None
+            if state.audio_mixer:
+                state.audio_mixer.cleanup()
+                state.audio_mixer = None
     
     async def _play_audio(self, state: VoiceState, pcm_data: bytes, flush: bool = False):
         """
-        Play PCM audio to the voice channel.
+        Play PCM audio to the voice channel via the audio mixer.
         
-        Audio is accumulated into a buffer and played as larger continuous chunks
-        to eliminate gaps between small chunks.
+        TTS audio is written directly to the mixer's TTS buffer, where it is
+        mixed with any playing music and output as a single stream.
         
         Args:
             state: Voice state for the guild
             pcm_data: PCM audio data (48kHz stereo 16-bit)
-            flush: If True, flush all remaining audio immediately (for end of response)
+            flush: If True, wait for all TTS audio to drain (end of response)
         """
         if not state.voice_client or not state.voice_client.is_connected():
             return
         
-        async with state._playback_lock:
-            # Accumulate audio in buffer
-            if pcm_data:
-                state._audio_buffer.write(pcm_data)
-            
-            # Play accumulated audio when we have enough (or when flush requested)
-            # 48kHz stereo 16-bit = 192000 bytes/sec
-            # Play in ~100ms chunks for lower TTFB (reduced from 48000/~250ms)
-            MIN_PLAYBACK_BYTES = 19200  # ~100ms of audio
-            
-            if flush or state._audio_buffer.tell() >= MIN_PLAYBACK_BYTES:
-                await self._flush_audio_buffer(state, wait_for_completion=flush)
-    
-    async def _flush_audio_buffer(self, state: VoiceState, wait_for_completion: bool = False):
-        """Flush accumulated audio to playback."""
-        if state._audio_buffer.tell() == 0:
+        if not state.audio_mixer:
             return
         
-        if not state.voice_client or not state.voice_client.is_connected():
-            state._audio_buffer.seek(0)
-            state._audio_buffer.truncate()
-            return
+        # Write TTS audio directly to the mixer
+        if pcm_data:
+            state.audio_mixer.write_tts(pcm_data)
         
-        # Wait for any current playback to finish
-        while state.voice_client.is_playing():
-            await asyncio.sleep(0.02)
-        
-        # Get accumulated audio
-        state._audio_buffer.seek(0)
-        audio_data = state._audio_buffer.read()
-        state._audio_buffer.seek(0)
-        state._audio_buffer.truncate()
-        
-        if audio_data:
-            # Play the accumulated audio as a single source
-            source = discord.PCMAudio(io.BytesIO(audio_data))
-            state.voice_client.play(source)
-            
-            # Optionally wait for playback to complete
-            if wait_for_completion:
-                while state.voice_client.is_playing():
-                    await asyncio.sleep(0.02)
+        # If flushing, wait for the TTS buffer to drain
+        if flush:
+            while state.audio_mixer and state.audio_mixer.has_tts_data():
+                await asyncio.sleep(0.02)
     
     async def _handle_transcript(self, ctx, text: str, role: str, is_final: bool):
         """Handle transcript updates."""
@@ -601,18 +601,13 @@ class GarvisDiscordBot(commands.Bot):
         Handle barge-in interruption.
         
         Called when the user starts speaking while the bot is responding.
-        Stops Discord audio playback and clears the audio buffer.
+        Clears TTS audio from the mixer but keeps music playing.
         """
-        # Stop any current Discord audio playback
-        if state.voice_client and state.voice_client.is_playing():
-            state.voice_client.stop()
+        # Clear TTS audio from the mixer (music continues)
+        if state.audio_mixer:
+            state.audio_mixer.clear_tts()
         
-        # Clear the audio buffer
-        async with state._playback_lock:
-            state._audio_buffer.seek(0)
-            state._audio_buffer.truncate()
-        
-        print("🛑 Discord playback stopped (barge-in)")
+        print("🛑 TTS cleared from mixer (barge-in)")
     
     async def _handle_disconnect_request(self, guild_id: int, ctx: Optional[commands.Context] = None):
         """
@@ -717,15 +712,15 @@ class GarvisDiscordBot(commands.Bot):
                         await state.pipeline.stop()
                         state.pipeline = None
                     
-                    if state._playback_task:
-                        state._playback_task.cancel()
-                        state._playback_task = None
+                    # Clean up music player and mixer
+                    if state.music_player:
+                        state.music_player.cleanup()
+                        state.music_player = None
+                    if state.audio_mixer:
+                        state.audio_mixer.cleanup()
+                        state.audio_mixer = None
                     
                     state.voice_client = None
-                    
-                    # Clear the audio buffer
-                    state._audio_buffer.seek(0)
-                    state._audio_buffer.truncate()
                     
                     print("🧹 Voice state cleaned up")
             return

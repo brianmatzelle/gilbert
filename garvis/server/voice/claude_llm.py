@@ -101,6 +101,11 @@ class ClaudeLLM:
         """
         Stream a response from Claude with tool calling support.
         
+        Uses the streaming API (messages.stream) so text flows to TTS in
+        real-time even when tools are available. When the LLM decides to
+        call a tool, the tool is executed and the result is fed back for
+        a follow-up streamed response.
+        
         Args:
             conversation_history: List of messages in Anthropic format
             tool_executor: Async function to execute tools: (tool_name, args) -> result string
@@ -112,88 +117,73 @@ class ClaudeLLM:
                 - {"type": "text", "content": "..."} for text chunks
                 - {"type": "tool_use", "name": "...", "input": {...}} when tool is called
                 - {"type": "tool_result", "name": "...", "result": "..."} after tool execution
-                - {"type": "stream_url", "url": "..."} when [DISPLAY_STREAM:url] is detected
         """
-        messages = list(conversation_history)
+        self._cancel_requested = False
+        
+        # Truncate conversation history
+        max_messages = MAX_CONVERSATION_TURNS * 2
+        messages = list(conversation_history[-max_messages:]) if len(conversation_history) > max_messages else list(conversation_history)
+        
         iterations = 0
         
         while iterations < max_tool_iterations:
             iterations += 1
             
             try:
-                # Make API call with tools
-                response = await self.client.messages.create(
+                # Build kwargs – only include tools if we have any
+                kwargs = dict(
                     model=self.model,
                     max_tokens=max_tokens,
                     system=self.system_prompt,
                     messages=messages,
-                    tools=self.tools
                 )
+                if self.tools:
+                    kwargs["tools"] = self.tools
                 
-                # Process response content blocks
-                text_content = ""
-                tool_uses = []
-                
-                for block in response.content:
-                    if block.type == "text":
-                        text_content += block.text
-                        yield {"type": "text", "content": block.text}
-                    elif block.type == "tool_use":
-                        tool_uses.append(block)
-                        yield {"type": "tool_use", "name": block.name, "input": block.input}
-                
-                # Check for stream URL in text content
-                if "[DISPLAY_STREAM:" in text_content:
-                    import re
-                    match = re.search(r'\[DISPLAY_STREAM:([^\]]+)\]', text_content)
-                    if match:
-                        yield {"type": "stream_url", "url": match.group(1)}
-                
-                # If no tool calls, we're done
-                if response.stop_reason == "end_turn" or not tool_uses:
-                    break
-                
-                # Execute tools and add results to messages
-                if tool_uses:
-                    # Add assistant message with tool use
-                    messages.append({
-                        "role": "assistant",
-                        "content": response.content
-                    })
+                # Stream the response (text arrives in real-time)
+                async with self.client.messages.stream(**kwargs) as stream:
+                    async for text in stream.text_stream:
+                        if self._cancel_requested:
+                            break
+                        yield {"type": "text", "content": text}
                     
-                    # Execute each tool and collect results
-                    tool_results = []
-                    for tool_use in tool_uses:
-                        tool_name = tool_use.name
-                        tool_input = tool_use.input
-                        
-                        # Execute the tool
-                        result = await tool_executor(tool_name, tool_input)
-                        
-                        yield {"type": "tool_result", "name": tool_name, "result": result}
-                        
-                        # Check for stream URL in tool result
-                        if "[DISPLAY_STREAM:" in result:
-                            import re
-                            match = re.search(r'\[DISPLAY_STREAM:([^\]]+)\]', result)
-                            if match:
-                                yield {"type": "stream_url", "url": match.group(1)}
-                        
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tool_use.id,
-                            "content": result
-                        })
+                    if self._cancel_requested:
+                        break
                     
-                    # Add tool results to messages
-                    messages.append({
-                        "role": "user",
-                        "content": tool_results
+                    # Get the complete message to check for tool calls
+                    response = await stream.get_final_message()
+                
+                # Extract tool_use blocks
+                tool_uses = [b for b in response.content if b.type == "tool_use"]
+                
+                if response.stop_reason != "tool_use" or not tool_uses:
+                    break  # No tools called, we're done
+                
+                # -- Tool execution loop --
+                # Add the full assistant message (text + tool_use blocks)
+                messages.append({"role": "assistant", "content": response.content})
+                
+                tool_results = []
+                for tool_use in tool_uses:
+                    yield {"type": "tool_use", "name": tool_use.name, "input": tool_use.input}
+                    
+                    result = await tool_executor(tool_use.name, tool_use.input)
+                    yield {"type": "tool_result", "name": tool_use.name, "result": result}
+                    
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use.id,
+                        "content": result,
                     })
+                
+                # Feed tool results back so the LLM can respond
+                messages.append({"role": "user", "content": tool_results})
+                # Loop continues → next iteration streams the follow-up response
             
             except Exception as e:
-                print(f"❌ Claude error: {e}")
-                yield {"type": "text", "content": f"I apologize, but I encountered an error: {str(e)}"}
+                if not self._cancel_requested:
+                    print(f"❌ Claude error: {e}")
+                    yield {"type": "text", "content": f"I apologize, but I encountered an error: {str(e)}"}
                 break
     
     async def get_response(

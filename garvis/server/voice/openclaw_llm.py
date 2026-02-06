@@ -11,7 +11,6 @@ This client connects to OpenClaw Gateway's OpenAI-compatible HTTP API.
 """
 
 import json
-import re
 from typing import AsyncGenerator, Optional, Callable, Awaitable
 import httpx
 
@@ -24,6 +23,7 @@ from config import (
     AUTO_JOIN_OPENCLAW_TIMEOUT,
     MAX_CONVERSATION_TURNS,
 )
+from tools import get_claude_tools
 
 
 class OpenClawLLM:
@@ -51,6 +51,9 @@ class OpenClawLLM:
         self.session_key = OPENCLAW_SESSION_KEY
         self.system_prompt = system_prompt
         
+        # Convert Claude tool schemas to OpenAI function-calling format
+        self.tools = self._convert_tools_to_openai_format(get_claude_tools())
+        
         # Cancellation support for barge-in
         self._cancel_requested = False
         
@@ -58,6 +61,21 @@ class OpenClawLLM:
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(60.0, connect=10.0)
         )
+    
+    @staticmethod
+    def _convert_tools_to_openai_format(claude_tools: list[dict]) -> list[dict]:
+        """Convert Claude tool format to OpenAI function calling format."""
+        openai_tools = []
+        for tool in claude_tools:
+            openai_tools.append({
+                "type": "function",
+                "function": {
+                    "name": tool["name"],
+                    "description": tool["description"],
+                    "parameters": tool["input_schema"],
+                }
+            })
+        return openai_tools
     
     def cancel(self):
         """
@@ -209,41 +227,175 @@ class OpenClawLLM:
         max_tool_iterations: int = 10
     ) -> AsyncGenerator[dict, None]:
         """
-        Stream a response from OpenClaw with tool calling support.
+        Stream a response from OpenClaw with local tool calling support.
         
-        Note: OpenClaw handles tool execution internally, so this method
-        primarily provides compatibility with the existing interface.
-        For full tool support, OpenClaw should be configured with the
-        appropriate tools in its agent configuration.
+        Tool definitions are sent in the request payload (OpenAI function-
+        calling format).  If the model decides to call a tool, we execute
+        it locally via *tool_executor* and feed the result back for a
+        follow-up streamed response.
+        
+        Text chunks are yielded in real-time so TTS latency stays low.
         
         Args:
             conversation_history: List of messages
-            tool_executor: Async function to execute tools (may be called by OpenClaw internally)
+            tool_executor: Async function: (tool_name, args_dict) -> result string
             max_tokens: Maximum tokens in response
-            max_tool_iterations: Maximum number of tool call rounds
+            max_tool_iterations: Max tool→response round-trips
             
         Yields:
             Dicts with:
                 - {"type": "text", "content": "..."} for text chunks
-                - {"type": "tool_use", "name": "...", "input": {...}} when tool is called
-                - {"type": "tool_result", "name": "...", "result": "..."} after tool execution
-                - {"type": "stream_url", "url": "..."} when [DISPLAY_STREAM:url] is detected
+                - {"type": "tool_use", "name": "...", "input": {...}} when a tool is called
+                - {"type": "tool_result", "name": "...", "result": "..."} after execution
         """
-        # For now, use the simple streaming method
-        # OpenClaw handles tool execution internally
-        text_buffer = ""
+        self._cancel_requested = False
         
-        async for chunk in self.stream_response(conversation_history, max_tokens):
-            text_buffer += chunk
-            yield {"type": "text", "content": chunk}
+        if not conversation_history:
+            return
+        
+        # Build messages with system prompt + truncated history
+        messages: list[dict] = []
+        if self.system_prompt:
+            messages.append({"role": "system", "content": self.system_prompt})
+        
+        max_messages = MAX_CONVERSATION_TURNS * 2
+        recent = conversation_history[-max_messages:] if len(conversation_history) > max_messages else conversation_history
+        messages.extend(recent)
+        
+        url = f"{self.gateway_url}/v1/chat/completions"
+        iterations = 0
+        
+        while iterations < max_tool_iterations:
+            iterations += 1
             
-            # Check for stream URL markers in accumulated text
-            if "[DISPLAY_STREAM:" in text_buffer:
-                match = re.search(r'\[DISPLAY_STREAM:([^\]]+)\]', text_buffer)
-                if match:
-                    yield {"type": "stream_url", "url": match.group(1)}
-                    # Clear the marker from buffer to avoid duplicate yields
-                    text_buffer = text_buffer.replace(match.group(0), "")
+            # -- build request payload --
+            payload: dict = {
+                "model": self.agent_id,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "stream": True,
+                "user": self.session_key,
+            }
+            if self.tools:
+                payload["tools"] = self.tools
+                payload["tool_choice"] = "auto"
+            
+            text_content = ""
+            # Accumulate tool calls streamed incrementally: {index: {id, name, arguments}}
+            tool_calls_acc: dict[int, dict] = {}
+            finish_reason = None
+            
+            try:
+                async with self._client.stream(
+                    "POST", url, headers=self._get_headers(), json=payload
+                ) as response:
+                    if response.status_code != 200:
+                        error_text = await response.aread()
+                        print(f"❌ OpenClaw error {response.status_code}: {error_text.decode()}")
+                        yield {"type": "text", "content": "I apologize, but I encountered an error connecting to OpenClaw."}
+                        return
+                    
+                    async for line in response.aiter_lines():
+                        if self._cancel_requested:
+                            break
+                        if not line or not line.startswith("data: "):
+                            continue
+                        
+                        data_str = line[6:]
+                        if data_str.strip() == "[DONE]":
+                            break
+                        
+                        try:
+                            data = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+                        
+                        choices = data.get("choices", [])
+                        if not choices:
+                            continue
+                        
+                        choice = choices[0]
+                        delta = choice.get("delta", {})
+                        
+                        # ---- streamed text ----
+                        content = delta.get("content", "")
+                        if content:
+                            text_content += content
+                            yield {"type": "text", "content": content}
+                        
+                        # ---- streamed tool_calls (incremental) ----
+                        for tc in delta.get("tool_calls", []):
+                            idx = tc.get("index", 0)
+                            if idx not in tool_calls_acc:
+                                tool_calls_acc[idx] = {"id": "", "name": "", "arguments": ""}
+                            if tc.get("id"):
+                                tool_calls_acc[idx]["id"] = tc["id"]
+                            fn = tc.get("function", {})
+                            if fn.get("name"):
+                                tool_calls_acc[idx]["name"] += fn["name"]
+                            if fn.get("arguments"):
+                                tool_calls_acc[idx]["arguments"] += fn["arguments"]
+                        
+                        finish_reason = choice.get("finish_reason") or finish_reason
+                
+                if self._cancel_requested:
+                    break
+                
+                # If no tool calls were made, we're done
+                if not tool_calls_acc or finish_reason not in ("tool_calls", "function_call"):
+                    break
+                
+                # -- execute tools locally and feed results back --
+                
+                # 1) Add assistant message (text + tool_calls) to conversation
+                assistant_msg: dict = {
+                    "role": "assistant",
+                    "content": text_content or None,
+                    "tool_calls": [
+                        {
+                            "id": tc_data["id"],
+                            "type": "function",
+                            "function": {
+                                "name": tc_data["name"],
+                                "arguments": tc_data["arguments"],
+                            },
+                        }
+                        for _, tc_data in sorted(tool_calls_acc.items())
+                    ],
+                }
+                messages.append(assistant_msg)
+                
+                # 2) Execute each tool and append results
+                for _, tc_data in sorted(tool_calls_acc.items()):
+                    name = tc_data["name"]
+                    try:
+                        args = json.loads(tc_data["arguments"])
+                    except json.JSONDecodeError:
+                        args = {}
+                    
+                    yield {"type": "tool_use", "name": name, "input": args}
+                    result = await tool_executor(name, args)
+                    yield {"type": "tool_result", "name": name, "result": result}
+                    
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc_data["id"],
+                        "content": result,
+                    })
+                
+                # Loop continues → next iteration streams the follow-up
+            
+            except httpx.ConnectError as e:
+                print(f"❌ OpenClaw connection error: {e}")
+                print(f"   Make sure OpenClaw Gateway is running at {self.gateway_url}")
+                yield {"type": "text", "content": "I apologize, but I cannot connect to OpenClaw."}
+                break
+            
+            except Exception as e:
+                if not self._cancel_requested:
+                    print(f"❌ OpenClaw error: {e}")
+                    yield {"type": "text", "content": f"I apologize, but I encountered an error: {str(e)}"}
+                break
     
     async def get_response(
         self,

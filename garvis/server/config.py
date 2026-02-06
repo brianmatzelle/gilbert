@@ -230,6 +230,22 @@ OPENCLAW_GATEWAY_TOKEN = os.getenv("OPENCLAW_GATEWAY_TOKEN", "")
 OPENCLAW_AGENT_ID = os.getenv("OPENCLAW_AGENT_ID", "main")
 OPENCLAW_SESSION_KEY = os.getenv("OPENCLAW_SESSION_KEY", "discord-voice-main")
 
+# ========== Multi-Speaker Conversation ==========
+# In group voice channels, multiple people talk simultaneously. The default
+# VAD-based turn detection waits for ALL audio to stop, which may never happen
+# in an active conversation. These settings add per-user silence tracking so
+# Garvis can respond when an individual user finishes speaking, even if others
+# are still talking.
+
+# Time to wait (ms) after a user finishes speaking before Garvis responds.
+# This "cool-down" lets other speakers chime in before Garvis takes the floor.
+# Lower = more responsive but may cut in too eagerly.  Higher = more polite.
+CONVERSATION_RESPONSE_DELAY_MS = int(os.getenv("CONVERSATION_RESPONSE_DELAY_MS", "1500"))
+
+# Hard cap (ms) on how long Garvis will accumulate speech before forcing a response.
+# Prevents Garvis from going completely silent in non-stop conversations.
+CONVERSATION_MAX_WAIT_MS = int(os.getenv("CONVERSATION_MAX_WAIT_MS", "8000"))
+
 # ========== Assistant Mode (Wake Word) ==========
 # When enabled, Garvis only responds when the user starts with "Garvis..."
 # Similar to Alexa - reduces unwanted responses and saves LLM compute
@@ -274,6 +290,19 @@ AUTO_JOIN_OPENCLAW_TIMEOUT = float(os.getenv("AUTO_JOIN_OPENCLAW_TIMEOUT", "5.0"
 # Whether Garvis should speak first when auto-joining (requires USE_OPENCLAW=true)
 # When enabled, Garvis will greet users or start conversations proactively
 AUTO_JOIN_SPEAK_FIRST = os.getenv("AUTO_JOIN_SPEAK_FIRST", "true").lower() == "true"
+
+# ========== Music Playback ==========
+# Garvis can play music from URLs (YouTube, SoundCloud, etc.) in voice channels.
+# Music is mixed with TTS output so Garvis can speak over songs.
+
+# Master toggle for music playback feature
+MUSIC_ENABLED = os.getenv("MUSIC_ENABLED", "true").lower() == "true"
+
+# Normal music volume (0.0 – 1.0) when Garvis is NOT speaking
+MUSIC_DEFAULT_VOLUME = float(os.getenv("MUSIC_DEFAULT_VOLUME", "0.30"))
+
+# Ducked music volume (0.0 – 1.0) when Garvis IS speaking (TTS active)
+MUSIC_DUCK_VOLUME = float(os.getenv("MUSIC_DUCK_VOLUME", "0.15"))
 
 # ========== Bot API Server (for OpenClaw Cron Jobs) ==========
 # When enabled, exposes HTTP endpoints for external control of voice features
