@@ -1,0 +1,30 @@
+{
+  // OpenClaw configuration for Garvis
+  // Docs: https://docs.openclaw.ai/gateway/configuration
+
+  agents: {
+    defaults: {
+      // Local vector memory search — indexes all memory/*.md and MEMORY.md
+      // so the agent can recall old memories even after daily session resets.
+      memorySearch: {
+        provider: "local",
+        query: {
+          hybrid: {
+            enabled: true,
+            vectorWeight: 0.7,
+            textWeight: 0.3,
+          },
+        },
+      },
+
+      // Memory flush: before compaction, run a silent turn that writes
+      // durable facts to memory/ files so they survive transcript rotation.
+      compaction: {
+        memoryFlush: {
+          enabled: true,
+          softThresholdTokens: 6000,
+        },
+      },
+    },
+  },
+}
