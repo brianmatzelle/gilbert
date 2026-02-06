@@ -5,7 +5,7 @@ Claude LLM integration for conversational responses with tool calling support
 from typing import AsyncGenerator, Optional, Callable, Awaitable
 from anthropic import AsyncAnthropic
 
-from config import ANTHROPIC_API_KEY, CLAUDE_MODEL, CLAUDE_SYSTEM_PROMPT
+from config import ANTHROPIC_API_KEY, CLAUDE_MODEL, CLAUDE_SYSTEM_PROMPT, MAX_CONVERSATION_TURNS
 from tools import get_claude_tools
 
 
@@ -68,12 +68,16 @@ class ClaudeLLM:
         # Reset cancellation flag at start of new stream
         self._cancel_requested = False
         
+        # Truncate conversation history to last N turns to reduce token count
+        max_messages = MAX_CONVERSATION_TURNS * 2
+        recent_history = conversation_history[-max_messages:] if len(conversation_history) > max_messages else conversation_history
+        
         try:
             async with self.client.messages.stream(
                 model=self.model,
                 max_tokens=max_tokens,
                 system=self.system_prompt,
-                messages=conversation_history
+                messages=recent_history
             ) as stream:
                 async for text in stream.text_stream:
                     # Check for cancellation (barge-in)

@@ -15,6 +15,7 @@ from config import (
     LOCAL_LLM_URL,
     LOCAL_LLM_MODEL,
     LOCAL_LLM_SYSTEM_PROMPT,
+    MAX_CONVERSATION_TURNS,
 )
 from tools import get_claude_tools
 
@@ -87,9 +88,13 @@ class LocalLLM:
         """
         self._cancel_requested = False
         
+        # Truncate conversation history to last N turns to reduce token count
+        max_messages = MAX_CONVERSATION_TURNS * 2
+        recent_history = conversation_history[-max_messages:] if len(conversation_history) > max_messages else conversation_history
+        
         # Build messages with system prompt
         messages = [{"role": "system", "content": self.system_prompt}]
-        messages.extend(conversation_history)
+        messages.extend(recent_history)
         
         try:
             stream = await self.client.chat.completions.create(

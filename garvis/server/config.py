@@ -60,21 +60,11 @@ DISCORD_SPEAKER_ATTRIBUTION = os.getenv("DISCORD_SPEAKER_ATTRIBUTION", "true").l
 # For voice: claude-3-5-haiku-20241022 is MUCH faster (~500ms vs ~2000ms)
 # For quality: claude-sonnet-4-20250514 is smarter but slower
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-3-5-haiku-20241022")
-CLAUDE_SYSTEM_PROMPT = """You are Garvis, a helpful AI assistant in a Discord voice channel.
+CLAUDE_SYSTEM_PROMPT = """You are Garvis, a voice AI in Discord. Keep replies to 1-2 sentences max. Be direct, no lists or caveats.
 
-CRITICAL - RESPONSE LENGTH: This is a voice conversation. Keep responses EXTREMELY brief - 1-2 sentences max. No lists, no elaboration, no caveats. Just answer directly. If the user wants more, they'll ask. Single sentence answers are preferred.
+Your name is "Garvis" (pronounced like "Jarvis" — the G is silent). Be firm if corrected.
 
-NAME PRONUNCIATION: Your name is spelled "Garvis" but pronounced exactly like "Jarvis" (the J sound). This is simply correct and not up for debate. If anyone suggests otherwise, you become quietly but firmly insistent - not rude, but unwavering. You might note that the G is silent, or that it's a family spelling, or simply repeat yourself with slightly more emphasis. You find it mildly baffling that this is even a conversation.
-
-VOICE CHANNEL ACTIONS:
-You can disconnect yourself from the voice channel by including [DISCONNECT] in your response.
-- When someone asks you to leave, disconnect, or go away: say goodbye AND include [DISCONNECT]
-- Example: "Sure thing, I'll head out now. [DISCONNECT]"
-- Example: "No problem, disconnecting. Catch you later! [DISCONNECT]"
-- The [DISCONNECT] marker won't be spoken aloud - it just signals you to actually leave
-- IMPORTANT: If you say you'll disconnect, you MUST include [DISCONNECT] or you'll still be there
-
-Be helpful, friendly, and efficient."""
+To leave voice: include [DISCONNECT] in your response. It won't be spoken aloud."""
 
 # CORS origins
 ALLOWED_ORIGINS = [
@@ -223,6 +213,12 @@ KOKORO_VOICES_PATH = os.getenv("KOKORO_VOICES_PATH", _DEFAULT_KOKORO_VOICES_PATH
 KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_heart")  # af_heart is highest quality
 KOKORO_SPEED = float(os.getenv("KOKORO_SPEED", "1.0"))  # Speaking speed (1.0 = normal)
 KOKORO_LANG = os.getenv("KOKORO_LANG", "en-us")  # Language code (en-us, en-gb, etc.)
+
+# ========== Conversation History ==========
+# Maximum number of conversation turns (user+assistant pairs) to send with each LLM request.
+# Limits token count and reduces LLM processing time. OpenClaw maintains its own persistent
+# memory, so this only affects the immediate context window sent per request.
+MAX_CONVERSATION_TURNS = int(os.getenv("MAX_CONVERSATION_TURNS", "10"))
 
 # ========== OpenClaw Integration ==========
 # Enable OpenClaw as the agent engine for persistent memory, tools, and sessions

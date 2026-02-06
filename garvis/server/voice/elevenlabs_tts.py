@@ -148,7 +148,9 @@ class ElevenLabsTTS:
     
     # ElevenLabs requires ~120 chars to start generating audio
     # We buffer text until we have enough, then send with flush=true
-    MIN_TEXT_CHARS = 50  # Lower threshold since we use flush
+    # First chunk uses a lower threshold with flush=true for faster TTFB
+    MIN_TEXT_CHARS = 50  # Standard threshold
+    MIN_TEXT_CHARS_FIRST = 20  # Lower threshold for first chunk (faster TTFB)
     
     # Keep-alive interval (send ping before 20s timeout)
     KEEP_ALIVE_INTERVAL = 15  # seconds
@@ -180,11 +182,13 @@ class ElevenLabsTTS:
         self._is_speaking = False
         self._stop_event = asyncio.Event()
         
-        # Audio buffer for smooth playback (prebuffer ~8KB of MP3, roughly 500ms)
-        self._audio_buffer = AudioBuffer(prebuffer_bytes=8000)
+        # Audio buffer for smooth playback (prebuffer ~4KB of MP3, roughly 250ms)
+        # Reduced from 8KB to lower TTFB while maintaining acceptable jitter tolerance
+        self._audio_buffer = AudioBuffer(prebuffer_bytes=4000)
         
         # Text buffer - accumulate text before sending to ElevenLabs
         self._text_buffer = ""
+        self._is_first_text_chunk = True  # Track first chunk for lower threshold
         
         # Track completed contexts to filter late messages
         self._completed_contexts: set[str] = set()
@@ -354,6 +358,7 @@ class ElevenLabsTTS:
         if not self._is_speaking:
             # Start a new context for this speech
             self._is_speaking = True
+            self._is_first_text_chunk = True  # Reset first chunk tracking
             self._stop_event.clear()
             self._audio_buffer.reset()
             self._text_buffer = ""
@@ -389,9 +394,14 @@ class ElevenLabsTTS:
         # Buffer the text
         self._text_buffer += text
         
-        # Send when we have enough text (ElevenLabs needs ~50+ chars to generate)
-        if len(self._text_buffer) >= self.MIN_TEXT_CHARS:
-            await self._send_buffered_text()
+        # Use lower threshold for first chunk to reduce TTFB, with flush=true
+        # to force audio generation even below ElevenLabs' internal threshold
+        threshold = self.MIN_TEXT_CHARS_FIRST if self._is_first_text_chunk else self.MIN_TEXT_CHARS
+        
+        if len(self._text_buffer) >= threshold:
+            flush_first = self._is_first_text_chunk
+            self._is_first_text_chunk = False
+            await self._send_buffered_text(flush=flush_first)
     
     async def _send_buffered_text(self, flush: bool = False):
         """Send buffered text to ElevenLabs."""

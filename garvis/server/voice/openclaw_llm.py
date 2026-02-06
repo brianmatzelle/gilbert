@@ -22,6 +22,7 @@ from config import (
     OPENCLAW_SESSION_KEY,
     CLAUDE_SYSTEM_PROMPT,  # Use same system prompt as Claude
     AUTO_JOIN_OPENCLAW_TIMEOUT,
+    MAX_CONVERSATION_TURNS,
 )
 
 
@@ -110,8 +111,9 @@ class OpenClawLLM:
             return
         
         # Build messages - include system prompt and recent history
-        # OpenClaw maintains its own memory, but we still send context
-        # for the current session turn
+        # OpenClaw maintains its own persistent memory, so we only need to send
+        # recent context. Truncating to MAX_CONVERSATION_TURNS reduces token count
+        # and LLM processing time significantly.
         messages = []
         
         # Add system prompt as first message
@@ -121,8 +123,11 @@ class OpenClawLLM:
                 "content": self.system_prompt
             })
         
-        # Add conversation history (OpenClaw will dedupe with its memory)
-        messages.extend(conversation_history)
+        # Truncate conversation history to last N turns (user+assistant pairs)
+        # Each turn = 2 messages, so max_messages = MAX_CONVERSATION_TURNS * 2
+        max_messages = MAX_CONVERSATION_TURNS * 2
+        recent_history = conversation_history[-max_messages:] if len(conversation_history) > max_messages else conversation_history
+        messages.extend(recent_history)
         
         # Build request payload
         payload = {

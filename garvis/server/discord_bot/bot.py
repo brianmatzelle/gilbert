@@ -549,8 +549,8 @@ class GarvisDiscordBot(commands.Bot):
             
             # Play accumulated audio when we have enough (or when flush requested)
             # 48kHz stereo 16-bit = 192000 bytes/sec
-            # Play in ~250ms chunks to match TTS prebuffer
-            MIN_PLAYBACK_BYTES = 48000  # ~250ms of audio
+            # Play in ~100ms chunks for lower TTFB (reduced from 48000/~250ms)
+            MIN_PLAYBACK_BYTES = 19200  # ~100ms of audio
             
             if flush or state._audio_buffer.tell() >= MIN_PLAYBACK_BYTES:
                 await self._flush_audio_buffer(state, wait_for_completion=flush)

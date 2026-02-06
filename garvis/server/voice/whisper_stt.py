@@ -40,15 +40,18 @@ class WhisperSTT:
     def __init__(
         self,
         on_transcript: Callable[[str, bool], Awaitable[None]],
-        on_speech_end: Callable[[str], Awaitable[None]]
+        on_speech_end: Callable[[str], Awaitable[None]],
+        use_external_vad: bool = False,
     ):
         """
         Args:
             on_transcript: Callback for transcript updates (text, is_final)
             on_speech_end: Callback when speech ends (final transcript)
+            use_external_vad: If True, skip internal silence detection (external VAD triggers transcription)
         """
         self.on_transcript = on_transcript
         self.on_speech_end = on_speech_end
+        self._use_external_vad = use_external_vad
         
         self._model = None
         self._connected = False
@@ -87,8 +90,13 @@ class WhisperSTT:
         self._model = await loop.run_in_executor(self._executor, load_model)
         self._connected = True
         
-        # Start silence detection task
-        self._silence_check_task = asyncio.create_task(self._silence_check_loop())
+        # Only start silence detection if no external VAD is handling speech boundaries
+        # When external VAD (Silero) is used, it calls on_vad_speech_end() directly,
+        # which is ~600ms faster than this internal polling loop
+        if not self._use_external_vad:
+            self._silence_check_task = asyncio.create_task(self._silence_check_loop())
+        else:
+            print("   (using external VAD for speech boundary detection)")
         
         print(f"✅ faster-whisper loaded ({WHISPER_MODEL} on {WHISPER_DEVICE})")
     
@@ -179,23 +187,30 @@ class WhisperSTT:
         
         # Convert to numpy array for faster-whisper
         audio_array = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+        audio_duration_sec = len(audio_array) / self._sample_rate
         
         # Run transcription in thread pool
         loop = asyncio.get_event_loop()
         
         def transcribe():
+            t_start = time.time()
             segments, info = self._model.transcribe(
                 audio_array,
-                beam_size=5,
+                beam_size=1,                        # Greedy decode for lower latency (was 5)
                 language="en",
-                vad_filter=True,  # Use Silero VAD inside whisper too
-                vad_parameters={
-                    "min_silence_duration_ms": 500,
-                    "speech_pad_ms": 200
-                }
+                condition_on_previous_text=False,    # Faster, prevents hallucination loops
+                vad_filter=False,                    # External Silero VAD already segments speech (was True)
             )
             # Collect all segment texts
-            return " ".join(segment.text.strip() for segment in segments)
+            text = " ".join(segment.text.strip() for segment in segments)
+            t_end = time.time()
+            
+            # Performance instrumentation: STT Real-Time Factor
+            transcribe_ms = (t_end - t_start) * 1000
+            rtf = (t_end - t_start) / audio_duration_sec if audio_duration_sec > 0 else 0
+            print(f"⏱️ STT: {transcribe_ms:.0f}ms for {audio_duration_sec:.1f}s audio (RTF={rtf:.2f})")
+            
+            return text
         
         try:
             transcript = await loop.run_in_executor(self._executor, transcribe)

@@ -96,6 +96,7 @@ from config import (
     DISCORD_SPEAKER_ATTRIBUTION,
     ASSISTANT_MODE,
     WAKE_WORD,
+    MAX_CONVERSATION_TURNS,
 )
 
 # Audio conversion - pydub requires ffmpeg
@@ -263,6 +264,12 @@ class DiscordVoicePipeline:
         # Audio buffer for TTS conversion (MP3 for cloud, WAV for local)
         self._tts_buffer = io.BytesIO()
         
+        # Performance instrumentation timestamps
+        self._t_first_tts_audio = 0.0      # When first TTS audio chunk arrives
+        self._t_speech_end = 0.0           # When speech end was triggered (VAD/STT)
+        self._tts_audio_received = False   # Whether we've received any TTS audio this turn
+        self._convert_time_total_ms = 0.0  # Accumulated audio conversion time per response
+        
         # Track which providers we're using
         self._use_local_stt = USE_LOCAL_STT
         self._use_local_llm = USE_LOCAL_LLM
@@ -325,9 +332,14 @@ class DiscordVoicePipeline:
         # Initialize STT (Speech-to-Text)
         if self._use_local_stt:
             print("🎤 Using local STT (faster-whisper)")
+            # When Silero VAD is available, tell Whisper to skip its internal silence
+            # detection polling loop -- VAD will trigger transcription directly via
+            # on_vad_speech_end(), saving ~600ms of redundant silence detection
+            has_external_vad = self.vad is not None and self.vad.is_available
             self.stt = WhisperSTT(
                 on_transcript=self._handle_transcript,
-                on_speech_end=_stt_speech_end
+                on_speech_end=_stt_speech_end,
+                use_external_vad=has_external_vad,
             )
         else:
             print("🎤 Using cloud STT (Deepgram)")
@@ -587,11 +599,17 @@ class DiscordVoicePipeline:
         This triggers faster than Deepgram's speech_final since it's local
         (no network latency). We use the pending transcript from Deepgram.
         
+        For local Whisper STT: triggers transcription directly instead of relying
+        on Whisper's internal silence polling (~600ms faster).
+        
         Semantic Turn Detection:
         - If the utterance appears incomplete (ends with "but", "um", etc.),
           we wait for an extended silence period before triggering a response.
         - This prevents cutting off users mid-thought while maintaining responsiveness.
         """
+        # Record speech end time for performance instrumentation
+        self._t_speech_end = time.time()
+        
         # Don't trigger if already processing
         if self._processing_response:
             return
@@ -601,6 +619,14 @@ class DiscordVoicePipeline:
             if self._turn_state != TurnState.LISTENING:
                 return
         
+        # For local Whisper STT: trigger transcription directly via VAD callback
+        # This bypasses Whisper's internal silence detection polling (~600ms savings)
+        # Whisper's on_speech_end callback will then call _handle_speech_end
+        if isinstance(self.stt, WhisperSTT):
+            await self.stt.on_vad_speech_end()
+            return
+        
+        # For cloud STT (Deepgram): use pending transcript from streaming
         transcript = self._pending_transcript.strip()
         if not transcript:
             # No transcript yet - let Deepgram's speech_final handle it
@@ -806,7 +832,7 @@ class DiscordVoicePipeline:
             "content": message_content
         })
         
-        # Get Claude response
+        # Get LLM response
         self.is_speaking = True
         self._speaking_start_time = time.time()  # Track for barge-in delay
         async with self._state_lock:
@@ -817,7 +843,12 @@ class DiscordVoicePipeline:
         t_llm_start = time.time()
         t_first_chunk = None
         
-        # Stream Claude's response directly to TTS for minimum latency
+        # Reset per-response performance counters
+        self._tts_audio_received = False
+        self._t_first_tts_audio = 0.0
+        self._convert_time_total_ms = 0.0
+        
+        # Stream LLM response directly to TTS for minimum latency
         # This uses the simple streaming method (no tools) for fastest response
         async for chunk in self.llm.stream_response(self.conversation_history):
             assistant_response += chunk
@@ -825,7 +856,7 @@ class DiscordVoicePipeline:
             await self.tts.add_text(chunk)
             if t_first_chunk is None:
                 t_first_chunk = time.time()
-                print(f"⏱️ Time to first chunk: {(t_first_chunk - t_llm_start)*1000:.0f}ms")
+                print(f"⏱️ LLM TTFC: {(t_first_chunk - t_llm_start)*1000:.0f}ms")
         
         t_llm_end = time.time()
         
@@ -838,8 +869,14 @@ class DiscordVoicePipeline:
                 "content": final_response
             })
             
+            # Trim conversation history to prevent unbounded growth
+            # Keep only the last MAX_CONVERSATION_TURNS turns (pairs of user+assistant)
+            max_messages = MAX_CONVERSATION_TURNS * 2
+            if len(self.conversation_history) > max_messages:
+                self.conversation_history = self.conversation_history[-max_messages:]
+            
             print(f"🤖 Garvis: {final_response}")
-            print(f"⏱️ LLM took {(t_llm_end - t_llm_start)*1000:.0f}ms")
+            print(f"⏱️ LLM total: {(t_llm_end - t_llm_start)*1000:.0f}ms")
             
             if self.on_transcript:
                 await self.on_transcript(final_response, "assistant", True)
@@ -853,8 +890,14 @@ class DiscordVoicePipeline:
             
             t_tts_end = time.time()
             
-            print(f"⏱️ TTS flush took {(t_tts_end - t_tts_start)*1000:.0f}ms")
-            print(f"⏱️ Total response time: {(t_tts_end - t_start)*1000:.0f}ms")
+            # ===== Performance Summary =====
+            print(f"⏱️ TTS flush: {(t_tts_end - t_tts_start)*1000:.0f}ms")
+            if self._t_first_tts_audio > 0:
+                ttfb = (self._t_first_tts_audio - t_start) * 1000
+                print(f"⏱️ TTFB (speech_end → first audio): {ttfb:.0f}ms")
+            if self._convert_time_total_ms > 0:
+                print(f"⏱️ Audio conversion total: {self._convert_time_total_ms:.0f}ms")
+            print(f"⏱️ Total response: {(t_tts_end - t_start)*1000:.0f}ms")
             
             # Check if Garvis wants to disconnect
             if "[DISCONNECT]" in assistant_response and self.on_disconnect_request:
@@ -886,6 +929,11 @@ class DiscordVoicePipeline:
         if not audio_bytes:
             return
         
+        # Track first TTS audio chunk for TTFB instrumentation
+        if not self._tts_audio_received:
+            self._tts_audio_received = True
+            self._t_first_tts_audio = time.time()
+        
         # Accumulate audio data
         self._tts_buffer.write(audio_bytes)
         
@@ -908,12 +956,16 @@ class DiscordVoicePipeline:
         
         # Convert audio to PCM for Discord (48kHz stereo 16-bit)
         # Run in thread pool to avoid blocking the event loop
+        t_convert_start = time.time()
         loop = asyncio.get_running_loop()
         pcm_data = await loop.run_in_executor(
             _get_tts_thread_pool(),
             self._convert_audio_to_pcm,
             audio_data
         )
+        t_convert_end = time.time()
+        self._convert_time_total_ms += (t_convert_end - t_convert_start) * 1000
+        
         if pcm_data:
             await self.on_audio_output(pcm_data, flush)
     
