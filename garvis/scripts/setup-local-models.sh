@@ -5,7 +5,8 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MODELS_DIR="$SCRIPT_DIR/models"
+PROJECT_ROOT="$SCRIPT_DIR/.."
+MODELS_DIR="$PROJECT_ROOT/models"
 
 echo "=========================================="
 echo "  Garvis Local AI Setup"
@@ -38,7 +39,7 @@ echo "=========================================="
 echo "  1. Setting up llama.cpp with CUDA"
 echo "=========================================="
 
-LLAMA_DIR="$SCRIPT_DIR/llama.cpp"
+LLAMA_DIR="$PROJECT_ROOT/llama.cpp"
 
 if [ -d "$LLAMA_DIR" ]; then
     echo "llama.cpp directory exists, updating..."
@@ -46,7 +47,7 @@ if [ -d "$LLAMA_DIR" ]; then
     git pull
 else
     echo "Cloning llama.cpp..."
-    cd "$SCRIPT_DIR"
+    cd "$PROJECT_ROOT"
     git clone https://github.com/ggerganov/llama.cpp.git
     cd "$LLAMA_DIR"
 fi
@@ -169,13 +170,14 @@ echo "=========================================="
 echo "  6. Creating llama.cpp server script"
 echo "=========================================="
 
-cat > "$SCRIPT_DIR/run-llama-server.sh" << 'EOF'
+cat > "$SCRIPT_DIR/run-llama-server.sh" << 'INNEREOF'
 #!/bin/bash
 # Start llama.cpp server with Qwen2.5-7B
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MODEL="$SCRIPT_DIR/models/llm/Qwen2.5-7B-Instruct-Q4_K_M.gguf"
-LLAMA_SERVER="$SCRIPT_DIR/llama.cpp/build/bin/llama-server"
+PROJECT_ROOT="$SCRIPT_DIR/.."
+MODEL="$PROJECT_ROOT/models/llm/Qwen2.5-7B-Instruct-Q4_K_M.gguf"
+LLAMA_SERVER="$PROJECT_ROOT/llama.cpp/build/bin/llama-server"
 
 if [ ! -f "$MODEL" ]; then
     echo "❌ Model not found: $MODEL"
@@ -205,7 +207,7 @@ echo ""
     --threads 4 \
     --parallel 1 \
     --cont-batching
-EOF
+INNEREOF
 
 chmod +x "$SCRIPT_DIR/run-llama-server.sh"
 echo "✅ Created run-llama-server.sh"

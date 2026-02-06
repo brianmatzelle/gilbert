@@ -389,6 +389,10 @@ class GarvisDiscordBot(commands.Bot):
     async def _start_listening(self, state: VoiceState, ctx: commands.Context):
         """Start the voice pipeline and audio capture."""
         
+        # Stop any existing recording first to avoid "Already recording" error
+        if state.voice_client and state.voice_client.recording:
+            state.voice_client.stop_recording()
+        
         # Clean up any existing pipeline/sink first (in case of reconnect)
         if state.audio_sink:
             await state.audio_sink.stop_processing()
@@ -842,13 +846,6 @@ class GarvisDiscordBot(commands.Bot):
                         break
                     if text_channel is None:
                         text_channel = tc
-            
-            # Note: Auto-join text greeting disabled - Garvis can greet via voice instead
-            # if text_channel:
-            #     await text_channel.send(
-            #         f"👋 Hey! I noticed {member.display_name} joined **{channel.name}**, so I hopped in too. "
-            #         f"Say `!leave` if you'd like me to go, or let me know if you'd prefer I don't auto-join in the future!"
-            #     )
             
             # Create a mock context for starting the pipeline
             # We need this because _start_listening expects a context

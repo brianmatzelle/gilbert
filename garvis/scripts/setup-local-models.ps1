@@ -5,7 +5,8 @@
 $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$ModelsDir = Join-Path $ScriptDir "models"
+$ProjectRoot = Split-Path -Parent $ScriptDir
+$ModelsDir = Join-Path $ProjectRoot "models"
 
 Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host "  Garvis Local AI Setup" -ForegroundColor Cyan
@@ -39,7 +40,7 @@ Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host "  1. Setting up llama.cpp with CUDA" -ForegroundColor Cyan
 Write-Host "==========================================" -ForegroundColor Cyan
 
-$LlamaDir = Join-Path $ScriptDir "llama.cpp"
+$LlamaDir = Join-Path $ProjectRoot "llama.cpp"
 
 if (Test-Path $LlamaDir) {
     Write-Host "llama.cpp directory exists, updating..."
@@ -48,7 +49,7 @@ if (Test-Path $LlamaDir) {
     Pop-Location
 } else {
     Write-Host "Cloning llama.cpp..."
-    Push-Location $ScriptDir
+    Push-Location $ProjectRoot
     git clone https://github.com/ggerganov/llama.cpp.git
     Pop-Location
 }
@@ -177,8 +178,9 @@ $RunLlamaScript = @'
 # Start llama.cpp server with Qwen2.5-7B
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Model = Join-Path $ScriptDir "models\llm\Qwen2.5-7B-Instruct-Q4_K_M.gguf"
-$LlamaServer = Join-Path $ScriptDir "llama.cpp\build\bin\Release\llama-server.exe"
+$ProjectRoot = Split-Path -Parent $ScriptDir
+$Model = Join-Path $ProjectRoot "models\llm\Qwen2.5-7B-Instruct-Q4_K_M.gguf"
+$LlamaServer = Join-Path $ProjectRoot "llama.cpp\build\bin\Release\llama-server.exe"
 
 if (-not (Test-Path $Model)) {
     Write-Host "Model not found: $Model" -ForegroundColor Red
@@ -211,6 +213,7 @@ Write-Host ""
 '@
 
 $RunLlamaScript | Out-File -FilePath (Join-Path $ScriptDir "run-llama-server.ps1") -Encoding UTF8
+# Note: run-llama-server.ps1 is created in scripts/ directory
 Write-Host "Created run-llama-server.ps1" -ForegroundColor Green
 
 # ==========================================

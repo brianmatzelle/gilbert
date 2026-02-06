@@ -9,7 +9,6 @@ Local (faster, requires setup-local-models.sh):
     faster-whisper STT → llama.cpp LLM → Piper TTS
 """
 
-import asyncio
 import json
 import re
 from typing import Optional, Union

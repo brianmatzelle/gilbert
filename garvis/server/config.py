@@ -163,8 +163,6 @@ BARGE_IN_MIN_SPEAK_MS = int(os.getenv("BARGE_IN_MIN_SPEAK_MS", "500"))
 # TTS streaming configuration  
 # Prebuffer: milliseconds of audio to accumulate before starting playback (smooths network jitter)
 TTS_PREBUFFER_MS = int(os.getenv("TTS_PREBUFFER_MS", "250"))
-# Legacy setting (no longer used with WebSocket TTS)
-TTS_BUFFER_THRESHOLD = int(os.getenv("TTS_BUFFER_THRESHOLD", "500"))
 
 # ========== Local Model Configuration ==========
 # Enable local models instead of cloud APIs for faster inference

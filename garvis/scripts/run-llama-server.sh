@@ -2,8 +2,9 @@
 # Start llama.cpp server with Qwen2.5-7B
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MODEL="$SCRIPT_DIR/models/llm/Qwen2.5-7B-Instruct-Q4_K_M.gguf"
-LLAMA_SERVER="$SCRIPT_DIR/llama.cpp/build/bin/llama-server"
+PROJECT_ROOT="$SCRIPT_DIR/.."
+MODEL="$PROJECT_ROOT/models/llm/Qwen2.5-7B-Instruct-Q4_K_M.gguf"
+LLAMA_SERVER="$PROJECT_ROOT/llama.cpp/build/bin/llama-server"
 
 if [ ! -f "$MODEL" ]; then
     echo "❌ Model not found: $MODEL"
