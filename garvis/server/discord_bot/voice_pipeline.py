@@ -162,9 +162,12 @@ class DiscordVoicePipeline:
     
     @staticmethod
     def _normalize_llm_output(text: str) -> str:
-        """Normalize LLM output to remove markers."""
+        """Normalize LLM output to remove markers and gateway artifacts."""
         text = re.sub(r'\[DISPLAY_STREAM:[^\]]+\]', '', text)
         text = re.sub(r'\[DISCONNECT\]', '', text)  # Remove disconnect marker
+        # Remove MEDIA: file paths from OpenClaw gateway TTS artifacts
+        # e.g. "MEDIA:/tmp/tts-EX9KNi/voice-1770505554459.mp3"
+        text = re.sub(r'MEDIA:\S+', '', text)
         text = re.sub(r'\s+', ' ', text).strip()
         return text
     
@@ -443,6 +446,149 @@ class DiscordVoicePipeline:
             self.vad.reset()
         
         print("🔌 Discord voice pipeline stopped")
+    
+    async def process_text_request(self, text: str, speaker_name: str = None, max_tokens: int = 4096) -> str:
+        """
+        Process a text request from a Discord text channel.
+        
+        Sends the text through the LLM with tool support, streams the response
+        to TTS (so Garvis speaks it aloud), and returns the full text response.
+        
+        This is used by the !r command to allow text channel interaction.
+        OpenClaw's gateway-level tools (like web_fetch) handle URL fetching
+        transparently, so requests like "read this paper at <url>" work
+        automatically.
+        
+        Args:
+            text: The user's text message
+            speaker_name: Display name of the user who sent the message
+            max_tokens: Maximum tokens in LLM response (higher for text requests)
+            
+        Returns:
+            The full text response from the LLM
+        """
+        if not self._running or not self.llm or not self.tts:
+            return ""
+        
+        # Don't interrupt if currently speaking
+        if self._turn_state == TurnState.SPEAKING:
+            return ""
+        
+        # Acquire processing lock
+        async with self._state_lock:
+            if self._turn_state != TurnState.LISTENING:
+                return ""
+            self._turn_state = TurnState.PROCESSING
+            self._processing_response = True
+        
+        try:
+            # Format message with speaker attribution
+            if speaker_name:
+                message_content = f"{speaker_name}: {text}"
+            else:
+                message_content = text
+            
+            # Add context note for text channel requests - this overrides the
+            # "1-2 sentences max" voice constraint from the system prompt so
+            # OpenClaw can provide full-length responses when appropriate.
+            # IMPORTANT: We explicitly tell the agent NOT to use its own TTS/audio
+            # tools — Garvis has a local TTS pipeline that will speak the text.
+            message_content = (
+                "[Text channel request — respond as fully as needed, "
+                "longer responses are fine. If asked to read or recite content, "
+                "return the FULL TEXT directly in your response. "
+                "Do NOT use any TTS, audio generation, or text-to-speech tools. "
+                "Do NOT output MEDIA: file paths. "
+                "Garvis has his own voice pipeline that will speak your text aloud.]\n"
+                + message_content
+            )
+            
+            print(f"📝 Text request from {speaker_name or 'unknown'}: {text[:80]}...")
+            
+            # Add user message to conversation history
+            self.conversation_history.append({
+                "role": "user",
+                "content": message_content
+            })
+            
+            # Set speaking state
+            self.is_speaking = True
+            self._speaking_start_time = time.time()
+            async with self._state_lock:
+                self._turn_state = TurnState.SPEAKING
+            await self._send_status()
+            
+            assistant_response = ""
+            t_start = time.time()
+            
+            # Reset per-response performance counters
+            self._tts_audio_received = False
+            self._t_first_tts_audio = 0.0
+            self._convert_time_total_ms = 0.0
+            
+            # Stream LLM response with tool support
+            async for event in self.llm.stream_response_with_tools(
+                self.conversation_history,
+                self._execute_tool,
+                max_tokens=max_tokens,
+            ):
+                if event.get("type") == "text":
+                    chunk = event["content"]
+                    assistant_response += chunk
+                    # Stream to TTS for voice output
+                    await self.tts.add_text(chunk)
+                elif event.get("type") == "tool_use":
+                    print(f"🔧 Tool call: {event.get('name')} ({event.get('input', {})})")
+                elif event.get("type") == "tool_result":
+                    print(f"🔧 Tool result: {event.get('name')} → {str(event.get('result', ''))[:100]}")
+            
+            # Finalize response
+            final_response = self._normalize_llm_output(assistant_response)
+            
+            if final_response:
+                self.conversation_history.append({
+                    "role": "assistant",
+                    "content": final_response
+                })
+                
+                # Trim conversation history
+                max_messages = MAX_CONVERSATION_TURNS * 2
+                if len(self.conversation_history) > max_messages:
+                    self.conversation_history = self.conversation_history[-max_messages:]
+                
+                print(f"🤖 Garvis (text request): {final_response[:100]}...")
+                
+                if self.on_transcript:
+                    await self.on_transcript(final_response, "assistant", True)
+                
+                # Flush TTS
+                await self.tts.flush()
+                await self._flush_tts_buffer(flush=True)
+                
+                t_end = time.time()
+                print(f"⏱️ Text request total: {(t_end - t_start)*1000:.0f}ms")
+                
+                # Check if Garvis wants to disconnect
+                if "[DISCONNECT]" in assistant_response and self.on_disconnect_request:
+                    asyncio.create_task(self._delayed_disconnect())
+            
+            return final_response
+        
+        finally:
+            # Always reset state
+            self.is_speaking = False
+            self._processing_response = False
+            self._pending_transcript = ""
+            if self.stt:
+                self.stt.current_transcript = ""
+            
+            self._first_transcript_time = 0.0
+            if self._response_timer_task and not self._response_timer_task.done():
+                self._response_timer_task.cancel()
+            
+            async with self._state_lock:
+                self._turn_state = TurnState.LISTENING
+            await self._send_status()
     
     async def speak_proactively(self, text: str) -> bool:
         """

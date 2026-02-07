@@ -107,6 +107,8 @@ class GarvisDiscordBot(commands.Bot):
         !leave - Leave the voice channel
         !listen @user - Only listen to a specific user
         !listen all - Listen to everyone
+        !r <message> - Send a text request to Garvis (text response only)
+        !g <message> - Voice request — Garvis joins and speaks the response
     """
     
     def __init__(self):
@@ -389,6 +391,213 @@ class GarvisDiscordBot(commands.Bot):
                 status_parts.append("👂 Assistant mode: **Disabled** (responds to everything)")
             
             await ctx.send("\n".join(status_parts))
+        
+        @self.command(name="r", help="Send a text request to Garvis: !r <your message>")
+        async def request(ctx: commands.Context, *, message: str = None):
+            """
+            Send a text request to Garvis and get a text response in the channel.
+            
+            Garvis responds in the text channel only (no voice).
+            Use !v instead if you want Garvis to speak the response aloud.
+            
+            OpenClaw's gateway tools (like web_fetch) handle URL fetching, so
+            requests like "read this paper at <url>" work automatically.
+            
+            Examples:
+                !r What's the weather like today?
+                !r Can you read this paper for us? https://example.com/paper.pdf
+                !r Summarize the key points from https://example.com/article
+            """
+            if not message:
+                await ctx.send(
+                    "❌ Please include a message. Example:\n"
+                    "`!r What's the weather like?`\n"
+                    "`!r Can you read this paper? https://example.com/paper.pdf`"
+                )
+                return
+            
+            guild_id = ctx.guild.id
+            speaker_name = ctx.author.display_name
+            
+            if not USE_OPENCLAW:
+                await ctx.send(
+                    "❌ OpenClaw is not enabled. Garvis needs OpenClaw to "
+                    "process text requests.\n"
+                    "Set `USE_OPENCLAW=true` in your `.env` file."
+                )
+                return
+            
+            # Show typing indicator while processing
+            async with ctx.typing():
+                try:
+                    from voice.openclaw_llm import OpenClawLLM
+                    
+                    openclaw = OpenClawLLM()
+                    
+                    # Build conversation with context note for text channel
+                    user_msg = (
+                        "[Text channel request — respond as fully as needed, "
+                        "longer responses are fine. If asked to read or recite "
+                        "content, return the FULL TEXT directly in your response. "
+                        "Do NOT use any TTS, audio generation, or text-to-speech "
+                        "tools. Do NOT output MEDIA: file paths. "
+                        "Garvis has his own voice pipeline that will speak your "
+                        "text aloud.]\n"
+                        f"{speaker_name}: {message}"
+                    )
+                    conversation = [{"role": "user", "content": user_msg}]
+                    
+                    response = ""
+                    async for event in openclaw.stream_response_with_tools(
+                        conversation,
+                        self._text_tool_executor,
+                        max_tokens=4096,
+                    ):
+                        if event.get("type") == "text":
+                            response += event["content"]
+                    
+                    await openclaw.close()
+                    
+                    if response:
+                        response = DiscordVoicePipeline._normalize_llm_output(response)
+                        for chunk in self._chunk_message(f"🤖 **Garvis**: {response}"):
+                            await ctx.send(chunk)
+                    else:
+                        await ctx.send("🤖 Garvis had nothing to say.")
+                
+                except Exception as e:
+                    print(f"❌ Text request error: {e}")
+                    await ctx.send(f"❌ Error processing request: {str(e)}")
+        
+        @self.command(name="g", help="Voice request — Garvis joins and speaks: !g <your message>")
+        async def voice_request(ctx: commands.Context, *, message: str = None):
+            """
+            Send a request to Garvis and have him speak the response aloud.
+            
+            Garvis will join your voice channel (if not already in one),
+            process the request through OpenClaw, speak the response via
+            TTS, and also post the text in the channel.
+            
+            This is like a combination of !join + !r — Garvis joins voice
+            and reads the response aloud. Use !r for text-only.
+            
+            Examples:
+                !g Hey Garvis, read this paper for us https://example.com/paper.pdf
+                !g What's the weather like today?
+                !g Tell us a story about pirates
+            """
+            if not message:
+                await ctx.send(
+                    "❌ Please include a message. Example:\n"
+                    "`!g Tell us a story about pirates`\n"
+                    "`!g Read this paper for us https://example.com/paper.pdf`"
+                )
+                return
+            
+            if not USE_OPENCLAW:
+                await ctx.send(
+                    "❌ OpenClaw is not enabled. Garvis needs OpenClaw to "
+                    "process voice requests.\n"
+                    "Set `USE_OPENCLAW=true` in your `.env` file."
+                )
+                return
+            
+            # User must be in a voice channel so we know where to join
+            if not ctx.author.voice:
+                await ctx.send("❌ You need to be in a voice channel for `!g`! Use `!r` for text-only.")
+                return
+            
+            channel = ctx.author.voice.channel
+            guild_id = ctx.guild.id
+            speaker_name = ctx.author.display_name
+            
+            # Get or create voice state
+            if guild_id not in self._voice_states:
+                self._voice_states[guild_id] = VoiceState(guild_id)
+            state = self._voice_states[guild_id]
+            
+            # Join voice channel if not already connected
+            needs_join = not (state.voice_client and state.voice_client.is_connected())
+            if needs_join:
+                try:
+                    if state.voice_client and state.voice_client.is_connected():
+                        await state.voice_client.move_to(channel)
+                    else:
+                        state.voice_client = await channel.connect()
+                    
+                    await ctx.send(f"🎤 Joined **{channel.name}** — processing your request...")
+                    
+                    # Start the voice pipeline
+                    await self._start_listening(state, ctx)
+                    
+                    # Give the pipeline a moment to fully initialize
+                    # (STT connect, TTS WebSocket connect, etc.)
+                    await asyncio.sleep(1.0)
+                    
+                except Exception as e:
+                    print(f"❌ Failed to join voice for !g: {e}")
+                    await ctx.send(f"❌ Failed to join voice channel: {str(e)}")
+                    return
+            else:
+                await ctx.send(f"🎤 Processing your request...")
+            
+            # Process the text request through the voice pipeline (voice only, no text response)
+            if state.pipeline:
+                response = await state.pipeline.process_text_request(
+                    message, speaker_name
+                )
+                if not response:
+                    await ctx.send("🤖 Garvis had nothing to say.")
+            else:
+                await ctx.send("❌ Voice pipeline failed to initialize. Try `!join` first, then `!r`.")
+    
+    @staticmethod
+    def _chunk_message(text: str, max_length: int = 2000) -> list[str]:
+        """Split a message into chunks that fit Discord's 2000 character limit."""
+        if len(text) <= max_length:
+            return [text]
+        
+        chunks = []
+        while text:
+            if len(text) <= max_length:
+                chunks.append(text)
+                break
+            
+            # Find a good split point (prefer newline, then space)
+            split_at = text.rfind('\n', 0, max_length)
+            if split_at == -1 or split_at < max_length // 2:
+                split_at = text.rfind(' ', 0, max_length)
+            if split_at == -1 or split_at < max_length // 2:
+                split_at = max_length
+            
+            chunks.append(text[:split_at])
+            text = text[split_at:].lstrip()
+        
+        return chunks
+    
+    async def _text_tool_executor(self, tool_name: str, args: dict) -> str:
+        """
+        Execute tools for text-only requests (no voice pipeline).
+        
+        Music tools aren't available without a voice connection.
+        Gateway-level tools (like web_fetch) are handled by OpenClaw
+        internally and never reach this executor.
+        """
+        import json as _json
+        
+        if tool_name in ("play_music", "stop_music", "set_music_volume"):
+            return _json.dumps({
+                "status": "error",
+                "error": (
+                    "Music playback requires Garvis to be in a voice channel. "
+                    "Ask the user to use !join first."
+                )
+            })
+        
+        if tool_name == "ping":
+            return _json.dumps({"status": "pong", "service": "Garvis Discord Bot"})
+        
+        return f"Unknown tool: {tool_name}"
     
     async def _start_listening(self, state: VoiceState, ctx: commands.Context):
         """Start the voice pipeline and audio capture."""
@@ -636,6 +845,8 @@ class GarvisDiscordBot(commands.Bot):
         print(f"     !bargein      - Toggle barge-in (interrupt) on/off")
         print(f"     !assistant    - Toggle assistant mode (wake word required)")
         print(f"     !status       - Show current status")
+        print(f"     !r <message>  - Text request (responds in chat)")
+        print(f"     !g <message>  - Voice request (joins & speaks aloud)")
         
         # Start API server for OpenClaw cron jobs
         if self._api_server:
