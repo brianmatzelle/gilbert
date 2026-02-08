@@ -26,6 +26,7 @@ pub fn run() {
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             commands::list_processes,
+            commands::list_audio_devices,
             commands::list_servers,
             commands::list_voice_channels,
             commands::start_stream,

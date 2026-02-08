@@ -10,9 +10,19 @@ const elements = {
     toggleToken: document.getElementById('toggleToken'),
     saveToken: document.getElementById('saveToken'),
     
+    // Source toggle
+    sourceApp: document.getElementById('sourceApp'),
+    sourceDevice: document.getElementById('sourceDevice'),
+    
     // Process selection
+    processGroup: document.getElementById('processGroup'),
     processSelect: document.getElementById('processSelect'),
     refreshProcesses: document.getElementById('refreshProcesses'),
+    
+    // Device selection
+    deviceGroup: document.getElementById('deviceGroup'),
+    deviceSelect: document.getElementById('deviceSelect'),
+    refreshDevices: document.getElementById('refreshDevices'),
     
     // Discord selection
     serverSelect: document.getElementById('serverSelect'),
@@ -37,10 +47,13 @@ const elements = {
 // State
 let state = {
     token: null,
+    sourceMode: 'application', // 'application' or 'device'
     processes: [],
+    devices: [],
     servers: [],
     channels: [],
     selectedProcess: null,
+    selectedDevice: null,
     selectedServer: null,
     selectedChannel: null,
     isStreaming: false,
@@ -61,9 +74,17 @@ function setupEventListeners() {
     elements.saveToken.addEventListener('click', saveToken);
     elements.tokenInput.addEventListener('input', onTokenInput);
     
+    // Source toggle
+    elements.sourceApp.addEventListener('click', () => setSourceMode('application'));
+    elements.sourceDevice.addEventListener('click', () => setSourceMode('device'));
+    
     // Process
     elements.refreshProcesses.addEventListener('click', refreshProcesses);
     elements.processSelect.addEventListener('change', onProcessChange);
+    
+    // Device
+    elements.refreshDevices.addEventListener('click', refreshAudioDevices);
+    elements.deviceSelect.addEventListener('change', onDeviceChange);
     
     // Discord
     elements.refreshServers.addEventListener('click', refreshServers);
@@ -125,6 +146,26 @@ function onTokenInput() {
     updateUI();
 }
 
+// Source mode functions
+function setSourceMode(mode) {
+    state.sourceMode = mode;
+    
+    // Update toggle button styles
+    elements.sourceApp.classList.toggle('active', mode === 'application');
+    elements.sourceDevice.classList.toggle('active', mode === 'device');
+    
+    // Show/hide appropriate dropdown
+    elements.processGroup.style.display = mode === 'application' ? 'flex' : 'none';
+    elements.deviceGroup.style.display = mode === 'device' ? 'flex' : 'none';
+    
+    // Load devices on first switch to device mode
+    if (mode === 'device' && state.devices.length === 0) {
+        refreshAudioDevices();
+    }
+    
+    updateUI();
+}
+
 // Process functions
 async function refreshProcesses() {
     try {
@@ -142,6 +183,25 @@ async function refreshProcesses() {
 function onProcessChange() {
     const pid = elements.processSelect.value;
     state.selectedProcess = pid ? parseInt(pid) : null;
+    updateUI();
+}
+
+// Audio device functions
+async function refreshAudioDevices() {
+    try {
+        setStatus('Loading audio devices...', 'default');
+        state.devices = await invoke('list_audio_devices');
+        populateSelect(elements.deviceSelect, state.devices, 'id', 'name', 'Select an audio device...');
+        elements.deviceSelect.disabled = false;
+        setStatus('Ready', 'default');
+    } catch (err) {
+        showError(`Failed to list audio devices: ${err}`);
+    }
+}
+
+function onDeviceChange() {
+    const deviceId = elements.deviceSelect.value;
+    state.selectedDevice = deviceId ? deviceId : null;
     updateUI();
 }
 
@@ -208,7 +268,8 @@ function onChannelChange() {
 // Streaming controls
 async function startStreaming() {
     if (!canStart()) {
-        showError('Please select an application, server, and voice channel');
+        const sourceLabel = state.sourceMode === 'application' ? 'an application' : 'an audio device';
+        showError(`Please select ${sourceLabel}, server, and voice channel`);
         return;
     }
     
@@ -216,14 +277,16 @@ async function startStreaming() {
         setStatus('Starting stream...', 'default');
         elements.startBtn.disabled = true;
         
-        await invoke('start_stream', {
-            config: {
-                process_id: state.selectedProcess,
-                guild_id: state.selectedServer,      // Keep as string to preserve precision
-                channel_id: state.selectedChannel,   // Keep as string to preserve precision
-                token: state.token,
-            }
-        });
+        // Build config based on source mode
+        const config = {
+            process_id: state.sourceMode === 'application' ? state.selectedProcess : null,
+            device_id: state.sourceMode === 'device' ? state.selectedDevice : null,
+            guild_id: state.selectedServer,      // Keep as string to preserve precision
+            channel_id: state.selectedChannel,   // Keep as string to preserve precision
+            token: state.token,
+        };
+        
+        await invoke('start_stream', { config });
         
         state.isStreaming = true;
         setStatus('Streaming audio', 'streaming');
@@ -302,8 +365,11 @@ function hideError() {
 }
 
 function canStart() {
+    const hasSource = state.sourceMode === 'application' 
+        ? state.selectedProcess 
+        : state.selectedDevice;
     return state.token && 
-           state.selectedProcess && 
+           hasSource && 
            state.selectedServer && 
            state.selectedChannel &&
            !state.isStreaming;
@@ -320,6 +386,9 @@ function updateUI() {
         elements.tokenInput.disabled = true;
         elements.saveToken.disabled = true;
         elements.processSelect.disabled = true;
+        elements.deviceSelect.disabled = true;
+        elements.sourceApp.disabled = true;
+        elements.sourceDevice.disabled = true;
         elements.serverSelect.disabled = true;
         elements.channelSelect.disabled = true;
     } else {
@@ -331,6 +400,9 @@ function updateUI() {
         elements.tokenInput.disabled = false;
         elements.saveToken.disabled = false;
         elements.processSelect.disabled = false;
+        elements.deviceSelect.disabled = false;
+        elements.sourceApp.disabled = false;
+        elements.sourceDevice.disabled = false;
         elements.serverSelect.disabled = !state.token;
         elements.channelSelect.disabled = !state.selectedServer;
     }

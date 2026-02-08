@@ -1,89 +1,68 @@
-// WASAPI Application Loopback Capture
+// WASAPI Audio Input Device Capture
 // SPDX-License-Identifier: GPL-3.0
 //
-// Captures audio from a specific Windows application by process ID
-// using WASAPI's application loopback feature (Windows 10+)
+// Captures audio from a hardware audio input device (e.g., Focusrite Scarlett 2i2)
+// using WASAPI's standard capture mode via DeviceEnumerator.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use thiserror::Error;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use wasapi::{AudioClient, Direction, SampleType, StreamMode, WasapiError, WaveFormat};
+use wasapi::{DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat};
 
-#[derive(Error, Debug)]
-pub enum AudioCaptureError {
-    #[error("WASAPI error: {0}")]
-    Wasapi(#[from] WasapiError),
-    #[error("Failed to initialize audio capture: {0}")]
-    InitError(String),
-    #[error("Process not found: {0}")]
-    ProcessNotFound(u32),
-    #[error("Capture stopped")]
-    Stopped,
+use super::capture::{AudioCaptureError, AudioCaptureHandle, AudioFormat};
+
+/// Info about an available audio input device
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioDeviceInfo {
+    /// Unique device ID (opaque string from Windows)
+    pub id: String,
+    /// Human-readable device name (e.g., "Focusrite USB Audio")
+    pub name: String,
 }
 
-/// Audio format for captured samples
-#[derive(Debug, Clone)]
-pub struct AudioFormat {
-    pub sample_rate: u32,
-    pub channels: u16,
-    pub bits_per_sample: u16,
-}
-
-impl Default for AudioFormat {
-    fn default() -> Self {
-        Self {
-            sample_rate: 48000,
-            channels: 2,
-            bits_per_sample: 32, // f32
-        }
+/// List all available audio input (capture) devices
+pub fn list_audio_input_devices() -> Result<Vec<AudioDeviceInfo>, AudioCaptureError> {
+    // Initialize COM for this call (safe to call multiple times)
+    let hr = wasapi::initialize_mta();
+    if hr.is_err() {
+        return Err(AudioCaptureError::InitError(format!("Failed to initialize COM: {:?}", hr)));
     }
-}
 
-/// Handle to control the audio capture
-pub struct AudioCaptureHandle {
-    stop_flag: Arc<AtomicBool>,
-    thread_handle: Option<std::thread::JoinHandle<()>>,
-}
+    let enumerator = DeviceEnumerator::new()
+        .map_err(|e| AudioCaptureError::InitError(format!("Failed to create device enumerator: {:?}", e)))?;
 
-impl AudioCaptureHandle {
-    /// Create a new AudioCaptureHandle
-    pub fn new(stop_flag: Arc<AtomicBool>, thread_handle: std::thread::JoinHandle<()>) -> Self {
-        Self {
-            stop_flag,
-            thread_handle: Some(thread_handle),
+    let collection = enumerator
+        .get_device_collection(&Direction::Capture)
+        .map_err(|e| AudioCaptureError::InitError(format!("Failed to get capture devices: {:?}", e)))?;
+
+    let mut devices = Vec::new();
+    for device_result in &collection {
+        if let Ok(device) = device_result {
+            let name = device.get_friendlyname().unwrap_or_else(|_| "Unknown Device".to_string());
+            let id = match device.get_id() {
+                Ok(id) => id,
+                Err(_) => continue, // Skip devices we can't identify
+            };
+            devices.push(AudioDeviceInfo { id, name });
         }
     }
 
-    /// Stop the audio capture
-    pub fn stop(&mut self) {
-        self.stop_flag.store(true, Ordering::SeqCst);
-        if let Some(handle) = self.thread_handle.take() {
-            let _ = handle.join();
-        }
+    log::info!("Found {} audio input devices", devices.len());
+    for dev in &devices {
+        log::debug!("  Audio device: {} ({})", dev.name, dev.id);
     }
 
-    /// Check if capture is still running
-    pub fn is_running(&self) -> bool {
-        !self.stop_flag.load(Ordering::SeqCst)
-    }
+    Ok(devices)
 }
 
-impl Drop for AudioCaptureHandle {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-/// Start capturing audio from a specific process
-/// Returns a handle to control the capture and a receiver for audio data
-pub fn start_capture(
-    process_id: u32,
-    include_tree: bool,
+/// Start capturing audio from a specific audio input device by device ID.
+/// Returns the same tuple as `start_capture` so the Discord pipeline is unchanged.
+pub fn start_device_capture(
+    device_id: String,
 ) -> Result<(AudioCaptureHandle, mpsc::Receiver<Vec<f32>>, AudioFormat), AudioCaptureError> {
     // Channel for sending audio data
-    // Larger buffer (2000) to handle bursty capture and consumer timing gaps
-    // At ~20ms per chunk, this is ~40 seconds of buffering
+    // Same buffer size as the application loopback capture
     let (tx, rx) = mpsc::channel::<Vec<f32>>(2000);
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_flag_clone = stop_flag.clone();
@@ -92,8 +71,8 @@ pub fn start_capture(
     let format = AudioFormat::default();
 
     let thread_handle = std::thread::spawn(move || {
-        if let Err(e) = capture_loop(process_id, include_tree, tx, stop_flag_clone) {
-            log::error!("Audio capture error: {}", e);
+        if let Err(e) = device_capture_loop(&device_id, tx, stop_flag_clone) {
+            log::error!("Device audio capture error: {}", e);
         }
     });
 
@@ -104,18 +83,13 @@ pub fn start_capture(
     ))
 }
 
-/// Main capture loop - runs in a separate thread
-fn capture_loop(
-    process_id: u32,
-    include_tree: bool,
+/// Main device capture loop - runs in a separate thread
+fn device_capture_loop(
+    device_id: &str,
     tx: mpsc::Sender<Vec<f32>>,
     stop_flag: Arc<AtomicBool>,
 ) -> Result<(), AudioCaptureError> {
-    log::info!(
-        "Starting audio capture for PID {} (include_tree: {})",
-        process_id,
-        include_tree
-    );
+    log::info!("Starting device audio capture for device: {}", device_id);
 
     // Initialize COM for this thread
     let hr = wasapi::initialize_mta();
@@ -123,9 +97,21 @@ fn capture_loop(
         return Err(AudioCaptureError::InitError(format!("Failed to initialize COM: {:?}", hr)));
     }
 
-    // Create application loopback client
-    let mut audio_client = AudioClient::new_application_loopback_client(process_id, include_tree)
-        .map_err(|e| AudioCaptureError::InitError(format!("Failed to create loopback client: {:?}", e)))?;
+    // Find the device by ID
+    let enumerator = DeviceEnumerator::new()
+        .map_err(|e| AudioCaptureError::InitError(format!("Failed to create device enumerator: {:?}", e)))?;
+
+    let device = enumerator
+        .get_device(device_id)
+        .map_err(|e| AudioCaptureError::InitError(format!("Failed to find device '{}': {:?}", device_id, e)))?;
+
+    let device_name = device.get_friendlyname().unwrap_or_else(|_| "Unknown".to_string());
+    log::info!("Capturing from device: {}", device_name);
+
+    // Get an AudioClient from the device
+    let mut audio_client = device
+        .get_iaudioclient()
+        .map_err(|e| AudioCaptureError::InitError(format!("Failed to get audio client: {:?}", e)))?;
 
     // Create desired format: 48kHz stereo f32 (Discord's preferred format)
     let desired_format = WaveFormat::new(32, 32, &SampleType::Float, 48000, 2, None);
@@ -155,7 +141,11 @@ fn capture_loop(
         .get_buffer_size()
         .map_err(|e| AudioCaptureError::InitError(format!("Failed to get buffer size: {:?}", e)))?;
 
-    log::info!("Audio capture initialized. Buffer size: {} frames", buffer_size);
+    log::info!(
+        "Device audio capture initialized. Device: {}, Buffer size: {} frames",
+        device_name,
+        buffer_size
+    );
 
     // Allocate buffer for reading (48kHz stereo f32 = 4 bytes per sample * 2 channels)
     let bytes_per_frame = 4 * 2;
@@ -166,9 +156,9 @@ fn capture_loop(
         .start_stream()
         .map_err(|e| AudioCaptureError::InitError(format!("Failed to start stream: {:?}", e)))?;
 
-    log::info!("Audio capture started successfully");
+    log::info!("Device audio capture started successfully for: {}", device_name);
 
-    // Capture loop
+    // Capture loop - identical structure to the application loopback capture
     while !stop_flag.load(Ordering::SeqCst) {
         // Wait for event (with timeout)
         if event_handle.wait_for_event(100).is_ok() {
@@ -190,10 +180,14 @@ fn capture_loop(
                         // Send to channel (don't block if receiver is behind)
                         if tx.try_send(samples).is_err() {
                             // Rate-limit overflow warnings to avoid log spam
-                            static OVERFLOW_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                            static OVERFLOW_COUNT: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
                             let count = OVERFLOW_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if count % 100 == 0 {
-                                log::warn!("Audio buffer overflow - dropped {} chunks (consumer not keeping up)", count + 1);
+                                log::warn!(
+                                    "Device audio buffer overflow - dropped {} chunks (consumer not keeping up)",
+                                    count + 1
+                                );
                             }
                         }
                     }
@@ -208,7 +202,7 @@ fn capture_loop(
 
     // Stop the stream
     let _ = audio_client.stop_stream();
-    log::info!("Audio capture stopped");
+    log::info!("Device audio capture stopped for: {}", device_name);
 
     Ok(())
 }

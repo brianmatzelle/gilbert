@@ -37,14 +37,30 @@
                 <button id="saveToken" class="btn secondary">Save Token</button>
             </section>
 
-            <!-- Application Selection -->
+            <!-- Audio Source Selection -->
             <section class="card">
                 <h2>Audio Source</h2>
-                <div class="select-group">
+                <div class="source-toggle">
+                    <button id="sourceApp" class="toggle-btn active" title="Capture from an application">
+                        Application
+                    </button>
+                    <button id="sourceDevice" class="toggle-btn" title="Capture from an audio input device">
+                        Audio Device
+                    </button>
+                </div>
+                <div id="processGroup" class="select-group">
                     <select id="processSelect" disabled>
                         <option value="">Select an application...</option>
                     </select>
                     <button id="refreshProcesses" class="icon-btn" title="Refresh list">
+                        🔄
+                    </button>
+                </div>
+                <div id="deviceGroup" class="select-group" style="display: none;">
+                    <select id="deviceSelect" disabled>
+                        <option value="">Select an audio device...</option>
+                    </select>
+                    <button id="refreshDevices" class="icon-btn" title="Refresh devices">
                         🔄
                     </button>
                 </div>

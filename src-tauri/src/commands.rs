@@ -1,7 +1,7 @@
 // Tauri IPC Commands
 // SPDX-License-Identifier: GPL-3.0
 
-use crate::audio::{self, AudioCaptureHandle};
+use crate::audio::{self, AudioCaptureHandle, AudioDeviceInfo};
 use crate::discord::{self, BotHandle, ServerInfo, VoiceChannelInfo};
 use crate::process::{self, ProcessInfo};
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,10 @@ pub struct AppState {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StreamConfig {
-    pub process_id: u32,
+    /// Process ID for application loopback capture (mutually exclusive with device_id)
+    pub process_id: Option<u32>,
+    /// Audio input device ID for hardware device capture (mutually exclusive with process_id)
+    pub device_id: Option<String>,
     /// Guild ID as string to preserve precision from JavaScript
     pub guild_id: String,
     /// Channel ID as string to preserve precision from JavaScript
@@ -37,6 +40,15 @@ pub struct StreamStatus {
 #[tauri::command(rename_all = "snake_case")]
 pub async fn list_processes() -> Result<Vec<ProcessInfo>, String> {
     Ok(process::list_audio_processes())
+}
+
+/// List all available audio input devices (e.g., Focusrite Scarlett 2i2)
+#[tauri::command(rename_all = "snake_case")]
+pub async fn list_audio_devices() -> Result<Vec<AudioDeviceInfo>, String> {
+    audio::list_audio_input_devices().map_err(|e| {
+        log::error!("Failed to list audio devices: {}", e);
+        format!("Failed to list audio devices: {}", e)
+    })
 }
 
 /// List Discord servers the bot is in
@@ -75,8 +87,9 @@ pub async fn start_stream(
     }
 
     log::info!(
-        "Starting stream: PID={}, Guild={}, Channel={}",
+        "Starting stream: process_id={:?}, device_id={:?}, Guild={}, Channel={}",
         config.process_id,
+        config.device_id,
         config.guild_id,
         config.channel_id
     );
@@ -85,12 +98,26 @@ pub async fn start_stream(
     let guild_id: u64 = config.guild_id.parse().map_err(|_| "Invalid guild ID")?;
     let channel_id: u64 = config.channel_id.parse().map_err(|_| "Invalid channel ID")?;
 
-    // Start audio capture
-    let (audio_handle, audio_rx, _format) = audio::start_capture(config.process_id, true)
-        .map_err(|e| {
-            log::error!("Audio capture failed for PID {}: {}", config.process_id, e);
-            format!("Failed to capture audio from process: {}. Make sure the application is running and producing audio.", e)
-        })?;
+    // Start audio capture from the appropriate source
+    let (audio_handle, audio_rx, _format) = match (&config.process_id, &config.device_id) {
+        (Some(pid), None) => {
+            // Application loopback capture
+            audio::start_capture(*pid, true).map_err(|e| {
+                log::error!("Audio capture failed for PID {}: {}", pid, e);
+                format!("Failed to capture audio from process: {}. Make sure the application is running and producing audio.", e)
+            })?
+        }
+        (None, Some(device_id)) => {
+            // Hardware audio input device capture
+            audio::start_device_capture(device_id.clone()).map_err(|e| {
+                log::error!("Device audio capture failed for '{}': {}", device_id, e);
+                format!("Failed to capture audio from device: {}. Make sure the device is connected.", e)
+            })?
+        }
+        _ => {
+            return Err("Must specify either a process_id or device_id (but not both)".to_string());
+        }
+    };
 
     // Start Discord bot
     let bot_handle = discord::start_bot(

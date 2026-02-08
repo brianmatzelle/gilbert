@@ -253,6 +253,38 @@ select:disabled {
     background: #4f5882;
 }
 
+/* Source Toggle */
+.source-toggle {
+    display: flex;
+    gap: 0;
+    margin-bottom: 12px;
+    border-radius: var(--border-radius);
+    overflow: hidden;
+    border: 1px solid var(--bg-tertiary);
+}
+
+.toggle-btn {
+    flex: 1;
+    padding: 8px 12px;
+    background: var(--bg-primary);
+    border: none;
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: var(--transition);
+}
+
+.toggle-btn:hover:not(.active) {
+    color: var(--text-secondary);
+    background: var(--bg-tertiary);
+}
+
+.toggle-btn.active {
+    background: var(--accent-primary);
+    color: var(--bg-primary);
+}
+
 /* Controls Section */
 .controls {
     margin-top: 8px;
