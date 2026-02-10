@@ -1,0 +1,16 @@
+[Unit]
+Description=Garvis Discord Bot
+After=network.target tailscaled.service mullvad-daemon.service garvis-server.service
+Wants=tailscaled.service garvis-server.service
+
+[Service]
+Type=simple
+User=cowboy
+WorkingDirectory=/home/cowboy/projects/gilbert/garvis/server
+Environment=PATH=/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/linuxbrew/.linuxbrew/bin/uv run python -m discord_bot.bot
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
