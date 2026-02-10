@@ -163,6 +163,14 @@ function setSourceMode(mode) {
         refreshAudioDevices();
     }
     
+    // If streaming and the new mode already has a selection, hot-swap the source
+    if (state.isStreaming) {
+        const hasSource = mode === 'application' ? state.selectedProcess : state.selectedDevice;
+        if (hasSource) {
+            changeAudioSource();
+        }
+    }
+    
     updateUI();
 }
 
@@ -183,6 +191,12 @@ async function refreshProcesses() {
 function onProcessChange() {
     const pid = elements.processSelect.value;
     state.selectedProcess = pid ? parseInt(pid) : null;
+    
+    // If streaming and a process is selected, hot-swap the audio source
+    if (state.isStreaming && state.selectedProcess && state.sourceMode === 'application') {
+        changeAudioSource();
+    }
+    
     updateUI();
 }
 
@@ -202,6 +216,12 @@ async function refreshAudioDevices() {
 function onDeviceChange() {
     const deviceId = elements.deviceSelect.value;
     state.selectedDevice = deviceId ? deviceId : null;
+    
+    // If streaming and a device is selected, hot-swap the audio source
+    if (state.isStreaming && state.selectedDevice && state.sourceMode === 'device') {
+        changeAudioSource();
+    }
+    
     updateUI();
 }
 
@@ -313,6 +333,25 @@ async function stopStreaming() {
     }
 }
 
+// Change audio source while streaming (hot-swap)
+async function changeAudioSource() {
+    try {
+        setStatus('Switching audio source...', 'default');
+        
+        const config = {
+            process_id: state.sourceMode === 'application' ? state.selectedProcess : null,
+            device_id: state.sourceMode === 'device' ? state.selectedDevice : null,
+        };
+        
+        await invoke('change_audio_source', { config });
+        
+        setStatus('Streaming audio', 'streaming');
+    } catch (err) {
+        showError(`Failed to switch audio source: ${err}`);
+        setStatus('Error switching source', 'error');
+    }
+}
+
 // UI helpers
 function populateSelect(select, items, valueKey, labelKey, placeholder) {
     select.innerHTML = `<option value="">${placeholder}</option>`;
@@ -382,15 +421,17 @@ function updateUI() {
         elements.stopBtn.style.display = 'block';
         elements.stopBtn.disabled = false;
         
-        // Disable all inputs while streaming
+        // Disable token and Discord destination while streaming
         elements.tokenInput.disabled = true;
         elements.saveToken.disabled = true;
-        elements.processSelect.disabled = true;
-        elements.deviceSelect.disabled = true;
-        elements.sourceApp.disabled = true;
-        elements.sourceDevice.disabled = true;
         elements.serverSelect.disabled = true;
         elements.channelSelect.disabled = true;
+        
+        // Keep audio source controls enabled for hot-swapping
+        elements.processSelect.disabled = false;
+        elements.deviceSelect.disabled = false;
+        elements.sourceApp.disabled = false;
+        elements.sourceDevice.disabled = false;
     } else {
         elements.startBtn.style.display = 'block';
         elements.stopBtn.style.display = 'none';

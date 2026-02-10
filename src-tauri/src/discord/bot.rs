@@ -133,25 +133,37 @@ pub async fn list_voice_channels(token: &str, guild_id: &str) -> Result<Vec<Voic
         .collect())
 }
 
-/// Audio source that reads from an mpsc channel
-/// Uses a VecDeque for efficient FIFO buffer operations
-/// The receiver is wrapped in a Mutex to make this struct Sync (required by Songbird's From<RawAdapter<A>> for Input)
-struct ChannelAudioSource {
+/// Shared bridge that allows hot-swapping the audio source receiver at runtime.
+/// The Discord bot holds an Arc to this, and the app state holds another Arc,
+/// so the audio source can be changed without disconnecting from Discord.
+pub struct AudioBridge {
     receiver: std::sync::Mutex<mpsc::Receiver<Vec<f32>>>,
     buffer: std::sync::Mutex<std::collections::VecDeque<u8>>,
     /// Maximum buffer size to prevent unbounded growth (5 seconds of audio at 48kHz stereo)
     max_buffer_size: usize,
 }
 
-impl ChannelAudioSource {
-    fn new(receiver: mpsc::Receiver<Vec<f32>>) -> Self {
+impl AudioBridge {
+    /// Create a new AudioBridge wrapping the given receiver
+    pub fn new(rx: mpsc::Receiver<Vec<f32>>) -> Arc<Self> {
         // 48kHz * 2 channels * 4 bytes/sample (f32) * 5 seconds = ~1.9MB max buffer
         let max_buffer_size = 48000 * 2 * 4 * 5;
-        Self {
-            receiver: std::sync::Mutex::new(receiver),
+        Arc::new(Self {
+            receiver: std::sync::Mutex::new(rx),
             buffer: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(48000 * 2 * 4)), // 1 second initial capacity
             max_buffer_size,
-        }
+        })
+    }
+
+    /// Swap the audio receiver with a new one (for changing audio source at runtime).
+    /// Clears the internal buffer to avoid playing stale audio from the old source.
+    pub fn swap_receiver(&self, new_rx: mpsc::Receiver<Vec<f32>>) {
+        // Acquire locks in consistent order: receiver then buffer
+        let mut receiver = self.receiver.lock().unwrap();
+        let mut buffer = self.buffer.lock().unwrap();
+        *receiver = new_rx;
+        buffer.clear();
+        log::info!("Audio bridge: receiver swapped, buffer cleared");
     }
 
     /// Fill the internal buffer from the channel (non-blocking)
@@ -213,13 +225,25 @@ impl ChannelAudioSource {
     }
 }
 
+/// Audio source that reads from the shared AudioBridge.
+/// Uses the bridge's VecDeque for efficient FIFO buffer operations.
+struct ChannelAudioSource {
+    bridge: Arc<AudioBridge>,
+}
+
+impl ChannelAudioSource {
+    fn new(bridge: Arc<AudioBridge>) -> Self {
+        Self { bridge }
+    }
+}
+
 impl Read for ChannelAudioSource {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         // #region agent log
         static READ_CALL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let call_num = READ_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let buf_len_before = buf.len();
-        let internal_buffer_before = self.buffer.lock().unwrap().len();
+        let internal_buffer_before = self.bridge.buffer.lock().unwrap().len();
         // Log ALL calls (unconditional) to see if read() is ever invoked
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(r"s:\Projects\guitar2discord\.cursor\debug.log") {
             use std::io::Write;
@@ -227,11 +251,11 @@ impl Read for ChannelAudioSource {
         }
         // #endregion
 
-        // Try to get more data from the channel
-        self.fill_buffer();
+        // Try to get more data from the channel via the bridge
+        self.bridge.fill_buffer();
 
         // Lock the buffer for the rest of this function
-        let mut buffer = self.buffer.lock().unwrap();
+        let mut buffer = self.bridge.buffer.lock().unwrap();
 
         // #region agent log
         let internal_buffer_after_fill = buffer.len();
@@ -324,12 +348,14 @@ impl SongbirdEventHandler for TrackErrorHandler {
     }
 }
 
-/// Start the Discord bot and connect to a voice channel
+/// Start the Discord bot and connect to a voice channel.
+/// The `audio_bridge` allows the audio source to be swapped at runtime
+/// without disconnecting the bot from Discord.
 pub async fn start_bot(
     token: String,
     guild_id: u64,
     channel_id: u64,
-    audio_rx: mpsc::Receiver<Vec<f32>>,
+    audio_bridge: Arc<AudioBridge>,
 ) -> Result<BotHandle, DiscordError> {
     let stop_flag = Arc::new(AtomicBool::new(false));
     let ready_flag = Arc::new(RwLock::new(false));
@@ -386,8 +412,8 @@ pub async fn start_bot(
     }
     // #endregion
 
-    // Create audio source from the channel
-    let audio_source = ChannelAudioSource::new(audio_rx);
+    // Create audio source backed by the shared bridge
+    let audio_source = ChannelAudioSource::new(audio_bridge);
 
     // #region agent log
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(r"s:\Projects\guitar2discord\.cursor\debug.log") {

@@ -18,6 +18,7 @@ pub fn run() {
     let state = AppState {
         bot_handle: Arc::new(Mutex::new(None)),
         audio_handle: Arc::new(Mutex::new(None)),
+        audio_bridge: Arc::new(Mutex::new(None)),
         is_streaming: Arc::new(Mutex::new(false)),
     };
 
@@ -31,6 +32,7 @@ pub fn run() {
             commands::list_voice_channels,
             commands::start_stream,
             commands::stop_stream,
+            commands::change_audio_source,
             commands::save_token,
             commands::get_token,
             commands::get_status,

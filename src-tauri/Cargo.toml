@@ -31,9 +31,6 @@ tokio = { version = "1", features = ["full", "sync"] }
 # Process enumeration
 sysinfo = "0.32"
 
-# Secure storage for bot token
-keyring = "3"
-
 # Error handling
 thiserror = "1"
 anyhow = "1"
