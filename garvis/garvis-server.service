@@ -1,0 +1,16 @@
+[Unit]
+Description=Garvis Backend (FastAPI/MCP)
+After=network.target tailscaled.service mullvad-daemon.service
+Wants=tailscaled.service
+
+[Service]
+Type=simple
+User=cowboy
+WorkingDirectory=/home/cowboy/projects/gilbert/garvis/server
+Environment=PATH=/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/linuxbrew/.linuxbrew/bin/uv run uvicorn main:app --host 0.0.0.0 --port 8001
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
