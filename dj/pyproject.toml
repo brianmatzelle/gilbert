@@ -1,0 +1,25 @@
+[project]
+name = "dj"
+version = "0.1.0"
+description = "Discord music bot — stream songs via ?play {url}"
+requires-python = ">=3.10"
+dependencies = [
+    # Discord
+    "py-cord[voice]>=2.4.0",
+
+    # Audio extraction
+    "yt-dlp>=2024.0.0",
+
+    # Config
+    "python-dotenv>=1.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["discord_bot"]
+
+[tool.uv]
+dev-dependencies = []
