@@ -11,11 +11,11 @@
     "windows": [
       {
         "title": "Guitar2Discord",
-        "width": 500,
-        "height": 650,
+        "width": 380,
+        "height": 550,
         "resizable": true,
-        "minWidth": 400,
-        "minHeight": 500
+        "minWidth": 320,
+        "minHeight": 400
       }
     ],
     "security": {
